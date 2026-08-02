@@ -77,7 +77,13 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
 	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
-	cmd.WaitDelay = 10 * time.Second
+	// 500ms, matching cursor-agent — the other backend whose CLI can deliver a
+	// terminal result while keeping a process alive. WaitDelay only applies once
+	// the child is gone but its stdio is still held, which is exactly the
+	// cut-short path: we cancel right after a complete result, so a long delay
+	// here would add that much latency to every reply. A CLI that exits cleanly
+	// never reaches the delay at all.
+	cmd.WaitDelay = 500 * time.Millisecond
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -118,17 +124,35 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		startTime := time.Now()
 		scanResult := b.processOutput(stdout, msgCh)
 
+		// openclaw delivered a complete result but would not exit. Cancel the
+		// run context so CommandContext kills it and cmd.Wait can return —
+		// otherwise this goroutine parks forever on an agent that has already
+		// finished, and the reply never reaches the user. Same protocol-boundary
+		// treatment cursor-agent gets on its terminal `result` event.
+		if scanResult.cutShort {
+			b.cfg.Logger.Warn("openclaw delivered its result but did not exit; "+
+				"treating the complete result as the protocol boundary",
+				"pid", cmd.Process.Pid)
+			cancel()
+		}
+
 		// Wait for process exit.
 		exitErr := cmd.Wait()
 		duration := time.Since(startTime)
 
-		if runCtx.Err() == context.DeadlineExceeded {
+		switch {
+		case scanResult.cutShort:
+			// A complete result is the protocol boundary. Ignore the
+			// cancellation and exit error caused by stopping an openclaw that
+			// lingers afterward — the run succeeded, and reporting it as
+			// "aborted" would throw away a reply we already hold.
+		case runCtx.Err() == context.DeadlineExceeded:
 			scanResult.status = "timeout"
 			scanResult.errMsg = fmt.Sprintf("openclaw timed out after %s", timeout)
-		} else if runCtx.Err() == context.Canceled {
+		case runCtx.Err() == context.Canceled:
 			scanResult.status = "aborted"
 			scanResult.errMsg = "execution cancelled"
-		} else if exitErr != nil && scanResult.status == "completed" {
+		case exitErr != nil && scanResult.status == "completed":
 			scanResult.status = "failed"
 			scanResult.errMsg = fmt.Sprintf("openclaw exited with error: %v", exitErr)
 		}
@@ -294,6 +318,13 @@ type openclawEventResult struct {
 	// which for the openclaw backend is the openclaw *agent* name passed
 	// via `--agent`, not the underlying model.
 	model string
+	// cutShort is true when the run ended because openclaw had delivered a
+	// complete result but would not exit, rather than because stdout reached
+	// EOF. The caller must cancel the run context before cmd.Wait() in that
+	// case — otherwise it waits on a process that never leaves — and must not
+	// report the resulting cancellation as an abort. Same treatment
+	// cursor-agent's `resultSeen` gets.
+	cutShort bool
 }
 
 // processOutput reads the JSON output from openclaw --json stdout and returns
@@ -318,7 +349,7 @@ type openclawEventResult struct {
 // the dominant happy path (one pretty-printed JSON blob) deterministic
 // while keeping NDJSON event support intact.
 func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclawEventResult {
-	buf, readErr := io.ReadAll(r)
+	buf, cutShort, readErr := readOpenclawStdout(r, openclawResultIdleGrace)
 	if readErr != nil {
 		return openclawEventResult{status: "failed", errMsg: fmt.Sprintf("read stdout: %v", readErr)}
 	}
@@ -329,7 +360,9 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 	// matches, we're done — no need to involve the line scanner at all.
 	if result, ok := parseWholeBufferOpenclawResult(buf); ok {
 		var output strings.Builder
-		return b.buildOpenclawEventResult(result, ch, &output)
+		res := b.buildOpenclawEventResult(result, ch, &output)
+		res.cutShort = cutShort
+		return res
 	}
 
 	// Fall-back path: NDJSON line scanner. Note that because we already
