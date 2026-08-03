@@ -140,6 +140,65 @@ func TestOpenclawExecuteStillWorksWhenCLIExits(t *testing.T) {
 	}
 }
 
+// TestOpenclawExecuteToleratesLingeringStderrHolder is the regression for the
+// review finding on #6276: lowering WaitDelay must not turn a delivered reply
+// into an error.
+//
+// WaitDelay's timer starts when Wait observes the child has exited, not only on
+// cancellation, so a *clean* exit reaches it whenever a descendant still holds
+// one of the pipes os/exec manages — and cmd.Stderr here is a plain io.Writer,
+// which is exactly such a pipe. Wait then returns exec.ErrWaitDelay despite the
+// process having exited 0, and without the dedicated case that fell through to
+// "openclaw exited with error" and discarded a fully parsed reply.
+//
+// The stub reproduces precisely that shape: stdout reaches EOF when the parent
+// exits (the descendant's own stdout goes to /dev/null so it is not a writer on
+// that pipe), while the descendant keeps stderr open for ~1s, well past the
+// 500ms delay.
+func TestOpenclawExecuteToleratesLingeringStderrHolder(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "openclaw")
+	script := `#!/bin/sh
+case "$1" in
+  --version) echo "openclaw 2026.5.27"; exit 0 ;;
+esac
+# Holds ONLY stderr: its stdout is /dev/null, so the stdout pipe's sole writer
+# is this parent and EOF arrives as soon as it exits.
+( sleep 1 ) >/dev/null &
+cat <<'JSON'
+` + completeOpenclawResult + `
+JSON
+exit 0
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write openclaw stub: %v", err)
+	}
+	b := newOpenclawTestBackend(bin)
+
+	session, err := b.Execute(context.Background(), "hi", ExecOptions{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for range session.Messages {
+	}
+	result, ok := <-session.Result
+	if !ok {
+		t.Fatal("result channel closed without a result")
+	}
+
+	if result.Status != "completed" {
+		t.Errorf("status = %q (error: %q), want completed — the process exited 0 "+
+			"and the result was parsed; a descendant holding stderr past "+
+			"WaitDelay must not discard a deliverable reply", result.Status, result.Error)
+	}
+	if !strings.Contains(result.Output, "the agent reply text") {
+		t.Errorf("output = %q, lost the reply", result.Output)
+	}
+	if result.SessionID != "sess-abc" {
+		t.Errorf("session id = %q, want sess-abc", result.SessionID)
+	}
+}
+
 // TestReadOpenclawStdoutDoesNotWaitForIdleGraceAtEOF pins that the idle grace is
 // only ever paid by a CLI that refuses to exit. A reader that reaches EOF must
 // return immediately even when the grace is set absurdly high.

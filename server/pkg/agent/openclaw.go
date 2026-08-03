@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -78,11 +79,21 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	hideAgentWindow(cmd)
 	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
 	// 500ms, matching cursor-agent — the other backend whose CLI can deliver a
-	// terminal result while keeping a process alive. WaitDelay only applies once
-	// the child is gone but its stdio is still held, which is exactly the
-	// cut-short path: we cancel right after a complete result, so a long delay
-	// here would add that much latency to every reply. A CLI that exits cleanly
-	// never reaches the delay at all.
+	// terminal result while keeping a process alive.
+	//
+	// Note what WaitDelay actually bounds, because it is easy to get wrong: the
+	// timer starts when the context is done OR when Wait observes the child has
+	// exited, whichever comes first. So a *clean* exit reaches it too, whenever
+	// any descendant still holds one of the pipes os/exec manages — and this
+	// backend has such a pipe, since cmd.Stderr below is a plain io.Writer. In
+	// that case Wait returns exec.ErrWaitDelay even though the process exited 0,
+	// which is why the status switch has to special-case it: the result is
+	// already parsed and in hand, and only a tail of stderr logs is lost.
+	//
+	// Lowering the bound is still right. The delay is only reached when someone
+	// is holding a pipe open, and on the cut-short path we deliberately kill a
+	// process that is doing exactly that — a long delay there would add its full
+	// length to every reply.
 	cmd.WaitDelay = 500 * time.Millisecond
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -152,6 +163,21 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		case runCtx.Err() == context.Canceled:
 			scanResult.status = "aborted"
 			scanResult.errMsg = "execution cancelled"
+		case errors.Is(exitErr, exec.ErrWaitDelay) && scanResult.status == "completed":
+			// The process itself exited successfully — that is what
+			// ErrWaitDelay means by definition — and only a lingering
+			// descendant kept one of os/exec's pipes open past WaitDelay.
+			// stdout has already been read to EOF and the result parsed, so the
+			// only thing lost is a tail of stderr log lines. Reporting this as
+			// a failure would discard a deliverable reply, which is a worse
+			// outcome than the hang this whole change fixes.
+			//
+			// Not folded into the cutShort case above: that path cancels on
+			// purpose, and a Cancel call makes Wait report the kill instead of
+			// ErrWaitDelay. This case is specifically the clean-exit one.
+			b.cfg.Logger.Warn("openclaw exited cleanly but a descendant held a "+
+				"pipe past WaitDelay; delivering the parsed result and dropping "+
+				"the stderr tail", "pid", cmd.Process.Pid)
 		case exitErr != nil && scanResult.status == "completed":
 			scanResult.status = "failed"
 			scanResult.errMsg = fmt.Sprintf("openclaw exited with error: %v", exitErr)

@@ -111,8 +111,12 @@ func readOpenclawStdout(r io.Reader, idleGrace time.Duration) (buf []byte, cutSh
 			return out, false, rerr
 
 		case <-ticker.C:
+			// Check the cheap conditions under the lock first and only copy the
+			// buffer once the silence threshold is actually met. Copying on every
+			// tick would allocate the whole accumulated result ~20 times per wait
+			// window, which for a large result is pure waste.
 			mu.Lock()
-			out := append([]byte(nil), acc...)
+			size := len(acc)
 			last := lastByte
 			done := atEOF
 			mu.Unlock()
@@ -120,9 +124,14 @@ func readOpenclawStdout(r io.Reader, idleGrace time.Duration) (buf []byte, cutSh
 			if done {
 				continue // let the <-finished branch report the final state
 			}
-			if len(out) == 0 || time.Since(last) < idleGrace {
+			if size == 0 || time.Since(last) < idleGrace {
 				continue
 			}
+
+			mu.Lock()
+			out := append([]byte(nil), acc...)
+			mu.Unlock()
+
 			if _, ok := parseWholeBufferOpenclawResult(out); !ok {
 				continue
 			}
