@@ -185,7 +185,7 @@ func TestOpenclawExecuteStillWorksWhenCLIExits(t *testing.T) {
 //
 // The stub reproduces precisely that shape: stdout reaches EOF when the parent
 // exits (the descendant's own stdout goes to /dev/null so it is not a writer on
-// that pipe), while the descendant keeps stderr open for ~1s, well past the
+// that pipe), while the descendant keeps stderr open for 5s, well past the
 // 500ms delay.
 func TestOpenclawExecuteToleratesLingeringStderrHolder(t *testing.T) {
 	dir := t.TempDir()
