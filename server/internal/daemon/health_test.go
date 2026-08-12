@@ -196,6 +196,30 @@ func TestHealthHandlerActiveTaskCountTracksCounter(t *testing.T) {
 	assertActiveTaskCount(t, handler, 0)
 }
 
+func TestHealthHandlerReportsRepoCoordinationActivity(t *testing.T) {
+	t.Parallel()
+
+	cache := &activityRepoCache{
+		activity: repocache.Activity{MaintenanceActive: 1, ForegroundWaiters: 3},
+	}
+	d := &Daemon{
+		cfg:        Config{CLIVersion: "v1.0.0"},
+		repoCache:  cache,
+		workspaces: map[string]*workspaceState{},
+		logger:     slog.Default(),
+	}
+	rec := httptest.NewRecorder()
+	d.healthHandler(time.Now()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	var resp HealthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.RepoMaintenanceActive != 1 || resp.RepoCheckoutWaiters != 3 {
+		t.Fatalf("repo activity = maintenance:%d waiters:%d, want 1/3", resp.RepoMaintenanceActive, resp.RepoCheckoutWaiters)
+	}
+}
+
 func TestShutdownHandlerPostCancelsDaemonContext(t *testing.T) {
 	t.Parallel()
 
@@ -371,7 +395,33 @@ func TestRepoCheckoutRejectsUnknownMode(t *testing.T) {
 	}
 }
 
-func newRepoCheckoutTestDaemon(t *testing.T, workspaceID, repoURL string, cache *recordingRepoCache) *Daemon {
+func TestRepoCheckoutReturnsRetryableBusyToCapableClient(t *testing.T) {
+	t.Parallel()
+
+	const workspaceID = "ws-checkout"
+	const repoURL = "https://github.com/org/repo.git"
+	cache := &busyRepoCache{recordingRepoCache: recordingRepoCache{lookupPath: "/cache/org/repo.git"}}
+	d := newRepoCheckoutTestDaemon(t, workspaceID, repoURL, cache)
+
+	rec := httptest.NewRecorder()
+	body := strings.NewReader(`{"url":"` + repoURL + `","workspace_id":"` + workspaceID + `","workdir":"/tmp/work","task_id":"task-1","retry_busy":true}`)
+	d.repoCheckoutHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/repo/checkout", body))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+	if got := rec.Header().Get(repoCheckoutRetryHeader); got != repoCheckoutRetryValueBusy {
+		t.Fatalf("%s = %q, want %q", repoCheckoutRetryHeader, got, repoCheckoutRetryValueBusy)
+	}
+	if got := cache.lastCreateParams().LockWaitTimeout; got != repoCheckoutLockWaitTimeout {
+		t.Fatalf("lock wait timeout = %s, want %s", got, repoCheckoutLockWaitTimeout)
+	}
+}
+
+func newRepoCheckoutTestDaemon(t *testing.T, workspaceID, repoURL string, cache repoCacheBackend) *Daemon {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/daemon/workspaces/"+workspaceID+"/repos" {
@@ -394,6 +444,24 @@ func newRepoCheckoutTestDaemon(t *testing.T, workspaceID, repoURL string, cache 
 		},
 		logger: slog.Default(),
 	}
+}
+
+type busyRepoCache struct {
+	recordingRepoCache
+}
+
+type activityRepoCache struct {
+	recordingRepoCache
+	activity repocache.Activity
+}
+
+func (c *activityRepoCache) Activity() repocache.Activity { return c.activity }
+
+func (c *busyRepoCache) CreateWorktreeContext(_ context.Context, params repocache.WorktreeParams) (*repocache.WorktreeResult, error) {
+	c.mu.Lock()
+	c.params = append(c.params, params)
+	c.mu.Unlock()
+	return nil, repocache.ErrRepoBusy
 }
 
 type blockingLookupRepoCache struct {

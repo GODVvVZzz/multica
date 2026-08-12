@@ -1376,7 +1376,7 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 	// named-profile host look like a conflict and break the standing contract
 	// that `daemon status` in a task reports on the daemon hosting it.
 	var conflict *daemonProfileMismatchError
-	if daemonAlive(health) && !inDaemonManagedExecutionContext() {
+	if daemonAlive(health) && !inDaemonTaskIdentityContext() {
 		errors.As(daemonIdentityMismatch(health, profile, healthPort), &conflict)
 	}
 
@@ -1413,15 +1413,16 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 }
 
 // daemonStatusHealthPort resolves which daemon `status` should probe. Outside a
-// task that is the --profile-derived port. Inside a managed task it is the
-// daemon-injected MULTICA_DAEMON_PORT and nothing else: healthPortForProfile
-// hashes whatever profile name the caller passes, so deriving the port there
-// would let a task report on a daemon that is not the one hosting it — and for
-// a task hosted by a named-profile daemon it would silently probe the default
-// daemon instead. A missing port fails closed rather than guessing.
+// task that is the --profile-derived port, even when a stale
+// MULTICA_DAEMON_PORT remains in the host environment. Inside a managed task it
+// is the daemon-injected port and nothing else: healthPortForProfile hashes
+// whatever profile name the caller passes, so deriving the port there would let
+// a task report on a daemon that is not the one hosting it — and for a task
+// hosted by a named-profile daemon it would silently probe the default daemon
+// instead. A missing port fails closed rather than guessing.
 func daemonStatusHealthPort(cmd *cobra.Command) (int, error) {
 	profile := resolveProfile(cmd)
-	if !inDaemonManagedExecutionContext() {
+	if !inDaemonTaskIdentityContext() {
 		return healthPortForProfile(profile), nil
 	}
 	if profile != "" {
