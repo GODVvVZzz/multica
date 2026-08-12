@@ -26,6 +26,21 @@ func configureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr.Setpgid = true
 }
 
+type collectorProcessTree struct{}
+
+func newCollectorProcessTree(_ *exec.Cmd) (*collectorProcessTree, error) {
+	return &collectorProcessTree{}, nil
+}
+
+func (*collectorProcessTree) attach(_ *exec.Cmd) error { return nil }
+
+func (*collectorProcessTree) terminate(cmd *exec.Cmd) error {
+	reapProcessTree(cmd)
+	return nil
+}
+
+func (*collectorProcessTree) close() {}
+
 func codexInitializeRetrySupported() bool { return true }
 
 // signalProcessGroup sends sig to the whole process group led by p (when the

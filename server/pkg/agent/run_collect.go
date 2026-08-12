@@ -13,12 +13,10 @@ import (
 	"context"
 )
 
-// collectDrainGrace bounds each of the two waits finish() performs: for the
-// direct child to be reaped, and for the reader goroutines to see EOF. Only a
-// descendant we failed to kill can consume the second one — on Unix the process
-// group kill closes the last write end, so it is not reached. On Windows there
-// is no group to signal (see proc_windows.go), so this is what keeps the call
-// bounded there, after which the read ends are closed outright.
+// collectDrainGrace bounds the total cleanup wait in finish(): the direct child
+// must be reaped and the reader goroutines must see EOF within this one budget.
+// If a descendant escaped the platform process-tree boundary, finish closes the
+// read ends outright when the budget expires.
 const collectDrainGrace = 5 * time.Second
 
 // outputBuffer accumulates one stream and records when the last write landed.
@@ -87,13 +85,15 @@ func (o *outputBuffer) idleFor() (time.Duration, bool) {
 // decides when reading is over.
 type collector struct {
 	cmd        *exec.Cmd
+	tree       *collectorProcessTree
 	outR, errR *os.File
 	stdout     outputBuffer
 	stderr     outputBuffer
 
-	readers  chan struct{} // closed once both absorb loops have returned
-	waitDone chan struct{} // closed once cmd.Wait has returned
-	waitErr  error         // valid after waitDone is closed
+	readers   chan struct{} // closed once both absorb loops have returned
+	waitDone  chan struct{} // closed once cmd.Wait has returned
+	waitErr   error         // valid after waitDone is closed
+	finishErr error         // valid after finishOnce has run
 
 	finishOnce sync.Once
 }
@@ -119,13 +119,33 @@ func startCollector(ctx context.Context, env []string, execPath string, args ...
 
 	cmd.Stdout = outW
 	cmd.Stderr = errW
+	tree, err := newCollectorProcessTree(cmd)
+	if err != nil {
+		outR.Close()
+		outW.Close()
+		errR.Close()
+		errW.Close()
+		return nil, fmt.Errorf("create process-tree owner: %w", err)
+	}
 
 	if startErr := cmd.Start(); startErr != nil {
+		tree.close()
 		outR.Close()
 		outW.Close()
 		errR.Close()
 		errW.Close()
 		return nil, startErr
+	}
+	if attachErr := tree.attach(cmd); attachErr != nil {
+		_ = tree.terminate(cmd)
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		tree.close()
+		outR.Close()
+		outW.Close()
+		errR.Close()
+		errW.Close()
+		return nil, fmt.Errorf("attach process-tree owner: %w", attachErr)
 	}
 
 	// Drop the parent's write ends immediately: otherwise EOF can never arrive
@@ -135,6 +155,7 @@ func startCollector(ctx context.Context, env []string, execPath string, args ...
 
 	c := &collector{
 		cmd:      cmd,
+		tree:     tree,
 		outR:     outR,
 		errR:     errR,
 		readers:  make(chan struct{}),
@@ -156,28 +177,24 @@ func startCollector(ctx context.Context, env []string, execPath string, args ...
 // append to the buffers — so the caller may snapshot them without racing.
 //
 // Safe to call more than once and from any of the caller's exit paths.
-func (c *collector) finish() {
+func (c *collector) finish() error {
 	c.finishOnce.Do(func() {
+		drainDeadline := time.Now().Add(collectDrainGrace)
 		// Reap whatever the CLI forked, on the success path too: a successful
 		// `openclaw --version` still leaves its helper behind, which is how
 		// orphans accumulate on a host that probes on a timer. This also
 		// releases the last write end so the readers below can see EOF.
-		reapProcessTree(c.cmd)
+		c.finishErr = c.tree.terminate(c.cmd)
 
 		// Bounded belt-and-braces: because this package owns the pipes, Wait is
 		// not being held open by a descendant, so it returns as soon as the
 		// direct child is gone — which reapProcessTree has just ensured.
-		select {
-		case <-c.waitDone:
-		case <-time.After(collectDrainGrace):
-		}
+		waitUntil(c.waitDone, drainDeadline)
 
-		select {
-		case <-c.readers:
-		case <-time.After(collectDrainGrace):
+		if !waitUntil(c.readers, drainDeadline) {
 			// A descendant we could not kill still holds a write end, so EOF
-			// will not arrive on its own (Windows has no process group to
-			// signal). Close the read ends: the in-flight Read returns at once,
+			// will not arrive on its own. Close the read ends: the in-flight Read
+			// returns at once,
 			// which is what lets the wait below terminate. Returning here
 			// without that wait would leave io.Copy appending to a buffer the
 			// caller is about to read.
@@ -188,7 +205,39 @@ func (c *collector) finish() {
 
 		c.outR.Close()
 		c.errR.Close()
+		c.tree.close()
 	})
+	return c.finishErr
+}
+
+func waitUntil(done <-chan struct{}, deadline time.Time) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func collectorError(commandErr, cleanupErr error) error {
+	if cleanupErr == nil {
+		return commandErr
+	}
+	if commandErr == nil {
+		return cleanupErr
+	}
+	return errors.Join(commandErr, cleanupErr)
 }
 
 // exitErr reports the command's exit error without blocking, and whether the
@@ -218,7 +267,7 @@ func (c *collector) exitErr() (error, bool) {
 //
 //  1. Returns within roughly the caller's context deadline plus
 //     collectDrainGrace, whatever the CLI leaves behind.
-//  2. On Unix, descendants the CLI forked are killed before returning, so
+//  2. Descendants the CLI forked are killed before returning, so
 //     invoking a CLI on a timer cannot accumulate orphans.
 //  3. No goroutine outlives the call, on any platform.
 //  4. The command's real exit status is reported, which openclawShimDiagnostic
@@ -235,8 +284,8 @@ func RunCollect(ctx context.Context, env []string, execPath string, args ...stri
 		return nil, "", startErr
 	}
 	<-c.waitDone
-	c.finish()
-	return c.stdout.snapshot(), string(c.stderr.snapshot()), c.waitErr
+	finishErr := c.finish()
+	return c.stdout.snapshot(), string(c.stderr.snapshot()), collectorError(c.waitErr, finishErr)
 }
 
 // reapProcessTree SIGKILLs the process group led by cmd's child, so helpers the
@@ -251,9 +300,8 @@ func RunCollect(ctx context.Context, env []string, execPath string, args ...stri
 // wrapping the whole pid space) not a practical concern, and it is the same
 // window the other backends' cancellation paths already live with.
 //
-// No-op on Windows, where there is no process-group signalling; finish() closes
-// the read ends instead. Owning descendants on Windows needs a Job Object,
-// which is the remaining half of MUL-5467.
+// On Windows the collector uses a Job Object instead; see
+// collectorProcessTree in proc_windows.go.
 func reapProcessTree(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return

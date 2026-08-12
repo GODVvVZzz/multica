@@ -4,28 +4,31 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // Windows contract coverage for the collector, requested in review of #6275.
 //
-// Windows is where the process-group half of MUL-5467 does not apply:
-// configureProcessGroup is a no-op and signalProcessGroup can only kill the
-// direct child, so a descendant holding the pipe cannot be reaped. What must
-// still hold there — and what these tests pin — is the local half:
+// Windows has no Unix process groups, so the collector uses a Job Object. These
+// tests pin both process-tree ownership and the platform-independent contract:
 //
 //   - the call returns rather than parking on a CLI that will not exit;
 //   - the output captured before that is complete and correct;
 //   - no goroutine started by startCollector outlives the call, so a daemon
 //     invoking these helpers on a timer cannot accumulate parked goroutines.
 //
-// Owning descendants on Windows needs a Job Object and is deliberately out of
-// scope for this change; these tests are the contract for what is in scope.
+// execenv/isolation_windows_test.go separately pins the outer Job Object around
+// the complete task-preparation helper.
 
 const windowsCollectJSON = `{"agents":[{"id":"main"}]}`
 
@@ -56,7 +59,7 @@ func windowsAssertNoGoroutineGrowth(t *testing.T, before int) {
 		if time.Now().After(deadline) {
 			t.Errorf("goroutines: %d before, %d after — the collector must join "+
 				"its reader and wait goroutines before returning, including on "+
-				"Windows where there is no process group to signal", before, got)
+				"Windows where cleanup uses a Job Object", before, got)
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -153,4 +156,89 @@ func TestWindowsRunCollectReturnsAndLeavesNoGoroutines(t *testing.T) {
 		t.Errorf("stdout = %q, lost the output", out)
 	}
 	windowsAssertNoGoroutineGrowth(t, before)
+}
+
+func TestWindowsRunCollectKillsDescendant(t *testing.T) {
+	tempDir := t.TempDir()
+	sourcePath := filepath.Join(tempDir, "fake_cli.go")
+	exePath := filepath.Join(tempDir, "fake_cli.exe")
+	pidPath := filepath.Join(tempDir, "descendant.pid")
+	const source = `package main
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"time"
+)
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "descendant" {
+		time.Sleep(time.Minute)
+		return
+	}
+	child := exec.Command(os.Args[0], "descendant")
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil { panic(err) }
+	if err := os.WriteFile(os.Getenv("DESCENDANT_PID_FILE"), []byte(fmt.Sprint(child.Process.Pid)), 0600); err != nil { panic(err) }
+	fmt.Println("fake-cli 1.2.3")
+}`
+	if err := os.WriteFile(sourcePath, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", exePath, sourcePath)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build Windows fake CLI: %v: %s", err, output)
+	}
+
+	env := append(os.Environ(), "DESCENDANT_PID_FILE="+pidPath)
+	out, _, err := RunCollect(context.Background(), env, exePath)
+	if err != nil {
+		t.Fatalf("RunCollect: %v", err)
+	}
+	if !strings.Contains(string(out), "fake-cli 1.2.3") {
+		t.Fatalf("stdout = %q, lost the direct child's output", out)
+	}
+	rawPID, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatalf("read descendant pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(rawPID)))
+	if err != nil {
+		t.Fatalf("parse descendant pid: %v", err)
+	}
+	descendantAlive := true
+	t.Cleanup(func() {
+		if descendantAlive {
+			process, findErr := os.FindProcess(pid)
+			if findErr != nil {
+				return
+			}
+			_ = process.Kill()
+		}
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		process, openErr := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
+		if errors.Is(openErr, windows.ERROR_INVALID_PARAMETER) {
+			descendantAlive = false
+			return
+		}
+		if openErr != nil {
+			t.Fatalf("open descendant pid %d: %v", pid, openErr)
+		}
+		state, waitErr := windows.WaitForSingleObject(process, 0)
+		windows.CloseHandle(process)
+		if waitErr != nil {
+			t.Fatalf("query descendant pid %d: %v", pid, waitErr)
+		}
+		if waitErr == nil && state == windows.WAIT_OBJECT_0 {
+			descendantAlive = false
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("descendant pid %d survived RunCollect", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

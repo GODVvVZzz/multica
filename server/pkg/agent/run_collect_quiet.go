@@ -113,11 +113,11 @@ func RunCollectQuiet(ctx context.Context, env []string, idleGrace time.Duration,
 		case <-c.waitDone:
 			// Clean exit, or a real non-zero one: the normal path, and it pays
 			// no idle wait at all.
-			c.finish()
-			return c.stdout.snapshot(), string(c.stderr.snapshot()), false, c.waitErr
+			finishErr := c.finish()
+			return c.stdout.snapshot(), string(c.stderr.snapshot()), false, collectorError(c.waitErr, finishErr)
 
 		case <-ctx.Done():
-			c.finish()
+			finishErr := c.finish()
 			out := c.stdout.snapshot()
 			// Deliberately no salvage. Reaching the deadline means we never saw
 			// output that `complete` accepted, so by the caller's own rule the
@@ -125,9 +125,9 @@ func RunCollectQuiet(ctx context.Context, env []string, idleGrace time.Duration,
 			// callers attribute ctx themselves and a "signal: killed" detail is
 			// worth keeping in the message.
 			if werr, reaped := c.exitErr(); reaped && werr != nil {
-				return out, string(c.stderr.snapshot()), true, werr
+				return out, string(c.stderr.snapshot()), true, collectorError(werr, finishErr)
 			}
-			return out, string(c.stderr.snapshot()), true, ctx.Err()
+			return out, string(c.stderr.snapshot()), true, collectorError(ctx.Err(), finishErr)
 
 		case <-ticker.C:
 			if complete == nil {
@@ -142,8 +142,8 @@ func RunCollectQuiet(ctx context.Context, env []string, idleGrace time.Duration,
 				continue
 			}
 			// A finished answer that has gone quiet: take it and reap the tree.
-			c.finish()
-			return out, string(c.stderr.snapshot()), true, nil
+			finishErr := c.finish()
+			return out, string(c.stderr.snapshot()), true, finishErr
 		}
 	}
 }

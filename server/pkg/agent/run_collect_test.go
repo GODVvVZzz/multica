@@ -31,6 +31,10 @@ import (
 // than any test would wait, then exit 0. The helper records its own pid so the
 // test can assert it was reaped.
 func writeForkingCLI(t *testing.T, pidFile string) string {
+	return writeForkingCLIOutput(t, pidFile, "fake-cli 1.2.3")
+}
+
+func writeForkingCLIOutput(t *testing.T, pidFile, output string) string {
 	t.Helper()
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-cli")
@@ -42,13 +46,34 @@ func writeForkingCLI(t *testing.T, pidFile string) string {
 # (and the group be reaped) before the helper ever runs, leaving the test with
 # no pid to assert on — the reaping is fast enough for that race to fire.
 while [ ! -s "` + pidFile + `" ]; do sleep 0.01; done
-echo "fake-cli 1.2.3"
+echo "` + output + `"
 exit 0
 `
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake cli: %v", err)
 	}
 	return script
+}
+
+// TestCheckOpenclawVersionReapsPipeHoldingGrandchild covers the task-start
+// version gate, which is separate from the daemon registration probe. It must
+// use RunCollect too: Execute calls this synchronously before it returns a
+// Session, so a pipe-holding descendant here would bypass both the provider
+// timeout and the daemon's inactivity watchdog.
+func TestCheckOpenclawVersionReapsPipeHoldingGrandchild(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "helper.pid")
+	cli := writeForkingCLIOutput(t, pidFile, "OpenClaw 2026.7.1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := checkOpenclawVersion(ctx, cli); err != nil {
+		t.Fatalf("checkOpenclawVersion: %v", err)
+	}
+
+	pid := waitForPidFile(t, pidFile)
+	if !waitForProcessGone(pid, 2*time.Second) {
+		t.Errorf("openclaw version helper pid %d still alive after version check", pid)
+	}
 }
 
 // waitForPidFile waits for the forked helper to record its pid.
@@ -155,6 +180,13 @@ func TestRunCollectSurfacesStderrAndExitStatus(t *testing.T) {
 	}
 }
 
+func TestCollectorErrorPreservesCommandErrorWithoutCleanupFailure(t *testing.T) {
+	want := &exec.ExitError{}
+	if got := collectorError(want, nil); got != want {
+		t.Fatalf("collectorError(command, nil) = %T %v, want original *exec.ExitError", got, got)
+	}
+}
+
 // TestRunCollectRespectsProcessGroupPrecondition pins the invariant the group
 // kill depends on: the child must lead its own group. If configureProcessGroup
 // ever stopped setting Setpgid, reapProcessTree would silently degrade to
@@ -214,8 +246,8 @@ func assertNoGoroutineGrowth(t *testing.T, before int) {
 
 // TestRunCollectLeavesNoGoroutines pins review item 3: the call must not park a
 // goroutine on a CLI whose descendant holds the pipe. Previously the wait
-// goroutine could sit in cmd.Wait indefinitely, which on Windows (no process
-// group to signal) had nothing to release it.
+// goroutine could sit in cmd.Wait indefinitely when no owned process-tree
+// boundary released the inherited pipe.
 func TestRunCollectLeavesNoGoroutines(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "helper.pid")
 	cli := writeForkingCLI(t, pidFile)

@@ -287,15 +287,17 @@ func customArgsContains(args []string, flag string) bool {
 // comment, so the message intentionally names the detected version
 // and the upgrade command.
 func checkOpenclawVersion(ctx context.Context, execPath string) error {
-	cmd := exec.CommandContext(ctx, execPath, "--version")
-	hideAgentWindow(cmd)
-	out, err := cmd.CombinedOutput()
+	// Use the same bounded process-tree-aware probe as daemon registration.
+	// This check runs synchronously before Execute creates the provider session,
+	// so a pipe-holding descendant here would otherwise leave a task marked
+	// running without a backend or an inactivity watchdog to stop it.
+	out, err := detectCLIVersion(ctx, execPath)
 	if err != nil {
 		return fmt.Errorf("openclaw --version failed: %w", err)
 	}
-	detected, ok := parseOpenclawVersion(string(out))
+	detected, ok := parseOpenclawVersion(out)
 	if !ok {
-		return fmt.Errorf("could not parse openclaw version from output: %q", strings.TrimSpace(string(out)))
+		return fmt.Errorf("could not parse openclaw version from output: %q", strings.TrimSpace(out))
 	}
 	if compareOpenclawVersion(detected, minOpenclawVersion) < 0 {
 		return fmt.Errorf("openclaw %s is below the minimum supported version %s. Run `openclaw update` to upgrade and try again.", detected, minOpenclawVersion)

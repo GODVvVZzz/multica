@@ -3,10 +3,15 @@
 package agent
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // createNewConsole allocates a fresh console for the child process. Combined
@@ -34,9 +39,100 @@ func hideAgentWindow(cmd *exec.Cmd) {
 }
 
 // configureProcessGroup is a no-op on Windows: there is no Setpgid/process-group
-// signalling. Descendant cleanup relies on the hidden console group set up by
-// hideAgentWindow plus exec.CommandContext / WaitDelay terminating the child.
+// signalling. Long-lived agent launches retain their existing direct-child
+// cancellation contract; the one-shot collector below adds a Job Object.
 func configureProcessGroup(cmd *exec.Cmd) {}
+
+type collectorProcessTree struct {
+	job windows.Handle
+}
+
+func newCollectorProcessTree(cmd *exec.Cmd) (*collectorProcessTree, error) {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(
+		job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
+		windows.CloseHandle(job)
+		return nil, fmt.Errorf("set KILL_ON_JOB_CLOSE: %w", err)
+	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
+	return &collectorProcessTree{job: job}, nil
+}
+
+func (c *collectorProcessTree) attach(cmd *exec.Cmd) error {
+	process, err := windows.OpenProcess(
+		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
+		false,
+		uint32(cmd.Process.Pid),
+	)
+	if err != nil {
+		return fmt.Errorf("open process: %w", err)
+	}
+	defer windows.CloseHandle(process)
+	if err := windows.AssignProcessToJobObject(c.job, process); err != nil {
+		return fmt.Errorf("assign process to job: %w", err)
+	}
+
+	thread, err := suspendedProcessThread(uint32(cmd.Process.Pid))
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(thread)
+	if _, err := windows.ResumeThread(thread); err != nil {
+		return fmt.Errorf("resume process thread: %w", err)
+	}
+	return nil
+}
+
+func suspendedProcessThread(processID uint32) (windows.Handle, error) {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return 0, fmt.Errorf("snapshot process threads: %w", err)
+	}
+	defer windows.CloseHandle(snapshot)
+
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	for err = windows.Thread32First(snapshot, &entry); err == nil; err = windows.Thread32Next(snapshot, &entry) {
+		if entry.OwnerProcessID != processID {
+			continue
+		}
+		thread, openErr := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+		if openErr != nil {
+			return 0, fmt.Errorf("open suspended process thread: %w", openErr)
+		}
+		return thread, nil
+	}
+	if !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+		return 0, fmt.Errorf("enumerate process threads: %w", err)
+	}
+	return 0, fmt.Errorf("suspended process %d has no thread", processID)
+}
+
+func (c *collectorProcessTree) terminate(_ *exec.Cmd) error {
+	if c == nil || c.job == 0 {
+		return nil
+	}
+	return windows.TerminateJobObject(c.job, 1)
+}
+
+func (c *collectorProcessTree) close() {
+	if c == nil || c.job == 0 {
+		return
+	}
+	_ = windows.CloseHandle(c.job)
+	c.job = 0
+}
 
 // codexInitializeRetrySupported remains false until Codex children are owned
 // by a Job Object and descendant termination can be positively confirmed.
