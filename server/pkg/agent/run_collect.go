@@ -1,16 +1,16 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
 	"syscall"
 	"time"
-
-	"context"
 )
 
 // collectDrainGrace bounds the total cleanup wait in finish(): the direct child
@@ -85,7 +85,6 @@ func (o *outputBuffer) idleFor() (time.Duration, bool) {
 // decides when reading is over.
 type collector struct {
 	cmd        *exec.Cmd
-	tree       *collectorProcessTree
 	outR, errR *os.File
 	stdout     outputBuffer
 	stderr     outputBuffer
@@ -119,33 +118,20 @@ func startCollector(ctx context.Context, env []string, execPath string, args ...
 
 	cmd.Stdout = outW
 	cmd.Stderr = errW
-	tree, err := newCollectorProcessTree(cmd)
-	if err != nil {
-		outR.Close()
-		outW.Close()
-		errR.Close()
-		errW.Close()
-		return nil, fmt.Errorf("create process-tree owner: %w", err)
-	}
 
-	if startErr := cmd.Start(); startErr != nil {
-		tree.close()
+	// startOwnedProcessTree rather than cmd.Start: on Windows it creates the
+	// child suspended and assigns it to a Job Object before it runs a single
+	// instruction, so a .cmd shim cannot spawn the real CLI outside the
+	// ownership boundary. On Unix configureProcessGroup above already did the
+	// equivalent and this is a plain Start. Either way the tree — not just the
+	// direct child — is what finish() gets to reap.
+	if startErr := startOwnedProcessTree(cmd, slog.Default()); startErr != nil {
+		releaseProcessGroup(cmd)
 		outR.Close()
 		outW.Close()
 		errR.Close()
 		errW.Close()
 		return nil, startErr
-	}
-	if attachErr := tree.attach(cmd); attachErr != nil {
-		_ = tree.terminate(cmd)
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		tree.close()
-		outR.Close()
-		outW.Close()
-		errR.Close()
-		errW.Close()
-		return nil, fmt.Errorf("attach process-tree owner: %w", attachErr)
 	}
 
 	// Drop the parent's write ends immediately: otherwise EOF can never arrive
@@ -155,7 +141,6 @@ func startCollector(ctx context.Context, env []string, execPath string, args ...
 
 	c := &collector{
 		cmd:      cmd,
-		tree:     tree,
 		outR:     outR,
 		errR:     errR,
 		readers:  make(chan struct{}),
@@ -184,7 +169,7 @@ func (c *collector) finish() error {
 		// `openclaw --version` still leaves its helper behind, which is how
 		// orphans accumulate on a host that probes on a timer. This also
 		// releases the last write end so the readers below can see EOF.
-		c.finishErr = c.tree.terminate(c.cmd)
+		reapProcessTree(c.cmd)
 
 		// Bounded belt-and-braces: because this package owns the pipes, Wait is
 		// not being held open by a descendant, so it returns as soon as the
@@ -205,7 +190,10 @@ func (c *collector) finish() error {
 
 		c.outR.Close()
 		c.errR.Close()
-		c.tree.close()
+		// Only now: on Windows closing the job handle is what kills anything
+		// still inside it, so it must not run while the tree could still be
+		// serving output.
+		releaseProcessGroup(c.cmd)
 	})
 	return c.finishErr
 }
@@ -300,11 +288,12 @@ func RunCollect(ctx context.Context, env []string, execPath string, args ...stri
 // wrapping the whole pid space) not a practical concern, and it is the same
 // window the other backends' cancellation paths already live with.
 //
-// On Windows the collector uses a Job Object instead; see
-// collectorProcessTree in proc_windows.go.
+// On Windows signalProcessGroup terminates the Job Object that
+// startOwnedProcessTree assigned the child to, which reaches the same
+// descendants; see proc_windows.go.
 func reapProcessTree(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	signalProcessGroup(cmd.Process, syscall.SIGKILL)
+	signalProcessGroup(cmd, syscall.SIGKILL)
 }
