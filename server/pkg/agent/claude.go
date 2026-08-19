@@ -72,7 +72,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		}
 	}()
 
-	cmd := exec.CommandContext(runCtx, execPath, args...)
+	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
 	hideAgentWindow(cmd)
 	// Run claude in its own process group so cancellation can reach the whole
 	// tree — the claude CLI plus the MCP servers and tool subprocesses it
@@ -89,7 +89,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	// only after the tree has been signalled. Returning nil keeps os/exec from
 	// racing us with its own kill; WaitDelay remains the hard backstop.
 	cmd.Cancel = func() error { return nil }
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args))
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -1106,22 +1106,30 @@ func cleanupMcpConfigTemp(path string) {
 // tests can shrink it without waiting out the real bound.
 var detectVersionTimeout = 10 * time.Second
 
-func detectCLIVersion(ctx context.Context, execPath string) (string, error) {
+func detectCLIVersion(ctx context.Context, runtimeCmd Command) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, detectVersionTimeout)
 	defer cancel()
 
-	// RunCollect, not cmd.Output(): a broken CLI (node/bun shim) can leave
+	// RunCollectCmd, not cmd.Output(): a broken CLI (node/bun shim) can leave
 	// grandchildren that inherited and still hold our stdout pipe open, and
 	// cmd.Output() blocks in Wait() until that pipe closes — defeating the
-	// timeout above. RunCollect owns the pipes so Wait returns on the direct
-	// child's exit, then kills the group so the grandchild cannot linger as an
-	// orphan. The previous cmd.WaitDelay backstop bounded the call but left
-	// that orphan running and reported exec.ErrWaitDelay, i.e. it failed a
-	// probe whose output had in fact arrived — and a failed version probe skips
-	// runtime registration entirely. See run_collect.go and MUL-5467.
-	data, _, err := RunCollect(ctx, nil, execPath, "--version")
+	// timeout above. The collector owns the pipes so Wait returns on the direct
+	// child's exit, then reaps the tree so the grandchild cannot linger as an
+	// orphan. The cmd.WaitDelay backstop this replaces bounded the call but left
+	// that orphan running and reported exec.ErrWaitDelay, i.e. it failed a probe
+	// whose output had in fact arrived — and a failed version probe skips runtime
+	// registration entirely. See run_collect.go and MUL-5467.
+	//
+	// Built through runtimeCmd.exec so a custom runtime's fixed_args prefix is
+	// still applied (MUL-6260); the collector is handed the finished command.
+	cmd := runtimeCmd.exec(ctx, "--version")
+	data, _, err := RunCollectCmd(ctx, cmd, nil)
 	if err != nil {
-		return "", fmt.Errorf("detect version for %s: %w", execPath, err)
+		// One provider-agnostic boundary for probes: DetectVersion routes every
+		// provider through here, so an ENOEXEC diagnosis added at this point
+		// reaches the reason the daemon reports for a skipped runtime
+		// (MUL-6164).
+		return "", fmt.Errorf("detect version for %s: %w", runtimeCmd, ExplainExecError(err))
 	}
 	return extractVersionLine(string(data)), nil
 }

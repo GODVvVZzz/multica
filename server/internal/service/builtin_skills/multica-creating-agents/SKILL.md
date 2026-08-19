@@ -180,6 +180,12 @@ handler inspects `custom_args` for a model flag. Pi is stricter at invocation
 time: `--thinking` in `custom_args` is filtered because the first-class
 `thinking_level` field owns that flag and must be the only source of its value.
 
+Never put credentials or other secrets in `custom_args`. Daemon command logs
+redact argument values, but the values still live in the provider process's
+argv and may be visible to other local processes through `ps` or `/proc`. Put
+provider credentials in `custom_env` instead, using its stdin or 0600 file
+input where possible.
+
 ## Env & secrets
 
 `custom_env` is secret material. The CLI offers three input channels; two keep
@@ -241,6 +247,37 @@ Two ways `mcp_config` differs from `custom_env`:
   it, and a workspace may force redaction for everyone.
 
 Provider support is not uniform: Qwen Code accepts a managed `mcp_config` through a daemon-owned 0600 temporary JSON file passed with `--mcp-config`; it is removed when the run exits. Leave the field unset (`null`) to inherit Qwen Code native settings.
+
+#### Workspace MCP servers
+
+A workspace keeps a LIBRARY of MCP servers (workspace Settings → MCP, or
+`multica workspace mcp list|add|update|remove`). Adding one there gives it to
+NO agent — same shape as a workspace skill. It reaches an agent only when
+someone assigns it:
+
+```bash
+multica workspace mcp list --output table        # find the server id
+multica agent mcp add <agent-id> <server-id>     # give it to one agent
+multica agent mcp disable <agent-id> <server-id> # stop sending it, keep the assignment
+multica agent mcp remove <agent-id> <server-id>  # take it away
+```
+
+At claim time the effective set is:
+
+| Layer | Reaches the agent when |
+| --- | --- |
+| runtime-local servers | always (the daemon merges the runtime's own file) |
+| workspace servers | assigned to THIS agent and left enabled |
+| the agent's own `mcp_config` | always; it WINS on a name collision |
+
+Two consequences worth knowing before writing an agent's config: assigning a
+shared server does not require re-listing it in `mcp_config` (they merge), and
+`mcp_config` is now only about servers private to that agent — a
+managed-but-empty `{}` no longer means anything about the workspace layer,
+because nothing is inherited in the first place.
+
+The stored entry is **write-only** — reads return the server's name and
+transport, never urls, commands, headers, or env, for any role.
 
 ## Skill binding
 

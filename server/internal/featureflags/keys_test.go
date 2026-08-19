@@ -44,3 +44,12 @@ func TestPluginsV1DefaultsOff(t *testing.T) {
 		t.Fatal("plugins_v1 must stay disabled unless explicitly enabled")
 	}
 }
+
+func TestPluginSubFlagsAreNotPublished(t *testing.T) {
+	flags := EvaluateFrontendPublicFlags(context.Background(), nil)
+	for _, retired := range []string{"private_plugins_v1", "remote_mcp_plugins_v1"} {
+		if _, published := flags[retired]; published {
+			t.Fatalf("retired Plugin sub-flag %q must not be published", retired)
+		}
+	}
+}

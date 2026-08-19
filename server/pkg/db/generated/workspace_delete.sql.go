@@ -85,6 +85,10 @@ detached_client_usage AS (
     UPDATE client_usage_daily
     SET workspace_id = NULL
     WHERE client_usage_daily.workspace_id = $1
+),
+deleted_share_links AS (
+    DELETE FROM workspace_share_link
+    WHERE workspace_share_link.workspace_id = $1
 )
 DELETE FROM workspace_invitation
 WHERE workspace_invitation.workspace_id = $1
@@ -118,6 +122,26 @@ WHERE autopilot_rule_version.workspace_id = $1
 
 func (q *Queries) DeleteWorkspaceAutopilotChildren(ctx context.Context, workspaceID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteWorkspaceAutopilotChildren, workspaceID)
+	return err
+}
+
+const deleteWorkspaceAutopilotQuotaPeriods = `-- name: DeleteWorkspaceAutopilotQuotaPeriods :exec
+DELETE FROM autopilot_quota_period
+WHERE autopilot_quota_period.workspace_id = $1
+`
+
+func (q *Queries) DeleteWorkspaceAutopilotQuotaPeriods(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteWorkspaceAutopilotQuotaPeriods, workspaceID)
+	return err
+}
+
+const deleteWorkspaceAutopilotQuotaReservations = `-- name: DeleteWorkspaceAutopilotQuotaReservations :exec
+DELETE FROM autopilot_quota_reservation
+WHERE autopilot_quota_reservation.workspace_id = $1
+`
+
+func (q *Queries) DeleteWorkspaceAutopilotQuotaReservations(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteWorkspaceAutopilotQuotaReservations, workspaceID)
 	return err
 }
 
@@ -461,37 +485,27 @@ WITH installations AS MATERIALIZED (
     FROM plugin_installation
     WHERE plugin_installation.workspace_id = $1
 ),
-deleted_health AS (
-    DELETE FROM plugin_health
-    WHERE workspace_id = $1
-),
-deleted_execution_manifests AS (
-    DELETE FROM plugin_execution_manifest
-    WHERE workspace_id = $1
-),
-deleted_snapshots AS (
-    DELETE FROM plugin_capability_snapshot
-    WHERE workspace_id = $1
-),
-deleted_workspace_state AS (
-    DELETE FROM plugin_workspace_capability_state
-    WHERE workspace_id = $1
-),
-deleted_bindings AS (
-    DELETE FROM plugin_binding
+deleted_storage AS (
+    DELETE FROM plugin_storage
     WHERE installation_id IN (SELECT id FROM installations)
 ),
-deleted_grants AS (
-    DELETE FROM plugin_grant
+deleted_secrets AS (
+    DELETE FROM plugin_secret
     WHERE installation_id IN (SELECT id FROM installations)
+),
+deleted_invocations AS (
+    DELETE FROM plugin_invocation
+    WHERE workspace_id = $1
 )
 DELETE FROM plugin_installation WHERE id IN (SELECT id FROM installations)
 `
 
-// Plugin relationships have no foreign keys or cascades. Delete the append-only
-// grant/binding history first, then installation rows. Global identity, release,
-// contribution, and artifact rows survive for other workspaces and historical
-// execution-manifest attribution.
+// Plugin relationships have no foreign keys or cascades. Storage and secrets
+// hang off the installation, so both leaf tables are cleared through the
+// workspace's installation ids before the installations themselves.
+// Hook call records are workspace-scoped in their own right, so this deletes by
+// workspace rather than through the installation ids: a row whose installation
+// was already uninstalled would otherwise survive the workspace it described.
 func (q *Queries) DeleteWorkspacePluginData(ctx context.Context, workspaceID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteWorkspacePluginData, workspaceID)
 	return err

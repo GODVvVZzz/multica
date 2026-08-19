@@ -35,6 +35,22 @@ describe("ProviderLogo", () => {
     expect(logo?.classList.contains("runtime-logo")).toBe(true);
   });
 
+  it("renders the official DeepSeek Harness mark instead of the generic fallback", () => {
+    const { container } = render(
+      <ProviderLogo provider="dsh" className="runtime-logo" />,
+    );
+
+    const logo = container.querySelector("svg");
+
+    // Inlined rather than loaded through <img>: currentColor only resolves
+    // against the host document, so an <img> would pin the mark to black and
+    // lose it against the dark theme.
+    expect(logo?.getAttribute("viewBox")).toBe("0 0 50 50");
+    expect(logo?.getAttribute("fill")).toBe("currentColor");
+    expect(logo?.querySelector("path")).not.toBeNull();
+    expect(logo?.classList.contains("runtime-logo")).toBe(true);
+  });
+
   it("renders the QwenPaw mark instead of the generic fallback", () => {
     const { container } = render(
       <ProviderLogo provider="qwenpaw" className="runtime-logo" />,
@@ -46,6 +62,23 @@ describe("ProviderLogo", () => {
     // separate light/dark marks upstream ships.
     expect(logo?.getAttribute("fill")).toBe("currentColor");
     expect(logo?.querySelector("path")).not.toBeNull();
+    expect(logo?.classList.contains("runtime-logo")).toBe(true);
+  });
+
+  it("renders the MiniMax Code mark instead of the generic fallback", () => {
+    const { container } = render(
+      <ProviderLogo provider="mcode" className="runtime-logo" />,
+    );
+
+    const logo = container.querySelector("svg");
+    const path = logo?.querySelector("path");
+
+    // Official MiniMax Code compound path: clipped-corner card + inner "m".
+    // currentColor follows the theme instead of pinning the mark to black.
+    expect(logo?.getAttribute("viewBox")).toBe("2.1 2 27.9 28");
+    expect(logo?.getAttribute("fill")).toBe("currentColor");
+    expect(path?.getAttribute("d")).toContain("M27.0157 5.80436");
+    expect(path?.getAttribute("d")).toContain("ZM11.0587 8.88053");
     expect(logo?.classList.contains("runtime-logo")).toBe(true);
   });
 });

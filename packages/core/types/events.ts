@@ -124,20 +124,24 @@ export interface IssueDeletedPayload {
 export interface IssueLabelsChangedPayload {
   issue_id: string;
   labels: Label[];
+  issue_revision?: number;
 }
 
 export interface IssueAttachmentsChangedPayload {
   issue_id: string;
+  issue_revision?: number;
 }
 
 export interface IssueMetadataChangedPayload {
   issue_id: string;
   metadata: IssueMetadata;
+  issue_revision?: number;
 }
 
 export interface IssuePropertiesChangedPayload {
   issue_id: string;
   properties: IssuePropertyValues;
+  issue_revision?: number;
 }
 
 export interface PropertyChangedPayload {
@@ -198,15 +202,18 @@ export interface InboxBatchArchivedPayload {
 
 export interface CommentCreatedPayload {
   comment: Comment;
+  issue_revision?: number;
 }
 
 export interface CommentUpdatedPayload {
   comment: Comment;
+  issue_revision?: number;
 }
 
 export interface CommentDeletedPayload {
   comment_id: string;
   issue_id: string;
+  issue_revision?: number;
 }
 
 export interface CommentResolvedPayload {
@@ -270,6 +277,13 @@ export interface TaskMessagePayload {
   input?: Record<string, unknown>;
   output?: string;
   created_at?: string;
+  /**
+   * Set when the server clipped `input` / `output` for the realtime fanout
+   * (MUL-6396). The persisted row is untouched — a client that needs the full
+   * text refetches it from the task-messages endpoint. Never set on REST
+   * responses.
+   */
+  truncated?: boolean;
 }
 
 export interface TaskQueuedPayload {
@@ -339,6 +353,7 @@ export interface TaskCancelledPayload {
 export interface ReactionAddedPayload {
   reaction: Reaction;
   issue_id: string;
+  comment_revision?: number;
 }
 
 export interface ReactionRemovedPayload {
@@ -347,11 +362,13 @@ export interface ReactionRemovedPayload {
   emoji: string;
   actor_type: string;
   actor_id: string;
+  comment_revision?: number;
 }
 
 export interface IssueReactionAddedPayload {
   reaction: IssueReaction;
   issue_id: string;
+  issue_revision?: number;
 }
 
 export interface IssueReactionRemovedPayload {
@@ -359,6 +376,7 @@ export interface IssueReactionRemovedPayload {
   emoji: string;
   actor_type: string;
   actor_id: string;
+  issue_revision?: number;
 }
 
 export interface ChatMessageEventPayload {

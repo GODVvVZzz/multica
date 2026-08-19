@@ -7,6 +7,20 @@ const (
 	DaemonCapabilityCoalescedCommentsV1 = "coalesced-comments-v1"
 	DaemonCapabilityExecutionManifestV1 = "execution-manifest-v1"
 	DaemonCapabilityAgentSkillV1        = "agent-skill-v1"
+	DaemonCapabilityRemoteMCPV1         = "remote-mcp-v1"
+	// DaemonCapabilityLocalWorktreeV1 advertises that the daemon implements
+	// worktree mode for local_directory resources (execution_mode=worktree).
+	//
+	// This is a CAPABILITY rather than a version check on purpose. The failure
+	// mode of getting it wrong is not a missing field — a daemon without the
+	// implementation json-skips execution_mode and runs the task IN PLACE,
+	// editing the working copy the user asked to isolate. Version strings
+	// cannot answer that reliably: a git-describe dev build ("v0.4.21-24-g…")
+	// is deliberately exempted from the version floor so `make daemon` stays
+	// unblocked, which let exactly such a daemon through (MUL-5707). A daemon
+	// that implements the mode says so; one that does not, cannot.
+	DaemonCapabilityLocalWorktreeV1 = "local-worktree-v1"
+
 	// DaemonCapabilityRPCV1 advertises that the daemon can carry
 	// request/response RPCs over the WebSocket control connection (MUL-4257).
 	// Gated so only daemons+servers that both support it route claim over WS;
@@ -157,6 +171,13 @@ type TaskMessagePayload struct {
 	Input     map[string]any `json:"input,omitempty"`   // tool input (tool_use only)
 	Output    string         `json:"output,omitempty"`  // tool output (tool_result only)
 	CreatedAt string         `json:"created_at,omitempty"`
+
+	// Truncated marks a payload whose Input/Output were clipped for the
+	// realtime fanout (MUL-6396). The REST list endpoints never set it — they
+	// always return the full persisted row — so a client that sees it knows
+	// the authoritative content is one GET away. Clients render the clipped
+	// text immediately and backfill the full row in the background.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // DaemonRegisterPayload is sent from daemon to server on connection.

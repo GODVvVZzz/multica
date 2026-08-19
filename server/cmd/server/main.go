@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,11 +19,13 @@ import (
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
+	"github.com/multica-ai/multica/server/internal/profiling"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/scheduler"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/featureflag"
+	"github.com/multica-ai/multica/server/pkg/llm"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -49,6 +52,13 @@ func redisClientName(existing, suffix string) string {
 		return existing + ":" + suffix
 	}
 	return "multica-api:" + suffix
+}
+
+func channelLeaseRedisURLFromEnv() string {
+	if dedicated := strings.TrimSpace(os.Getenv("CHANNEL_WS_LEASE_REDIS_URL")); dedicated != "" {
+		return dedicated
+	}
+	return strings.TrimSpace(os.Getenv("REDIS_URL"))
 }
 
 func closeRedisClient(label string, client *redis.Client) {
@@ -96,6 +106,59 @@ func envPositiveInt(name string, def int) int {
 		return def
 	}
 	return v
+}
+
+func envNonNegativeInt(name string, def int) int {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 0 {
+		slog.Warn("invalid env var, using default", "name", name, "value", raw, "default", def, "error", err)
+		return def
+	}
+	return v
+}
+
+// maxLLMRetriesLimit caps MULTICA_LLM_MAX_RETRIES. The ceiling is a latency
+// budget, not a taste call: SDK backoff is 0.5s doubling to an 8s cap, so 6
+// retries spend ~21s and 10 spend ~48s sleeping before the last attempt. Every
+// internal caller of pkg/llm runs under a far tighter deadline (8s for chat
+// quick actions, 20s for title generation), so a budget past 5 cannot finish —
+// it only converts a retryable upstream failure into a deadline-exceeded one.
+const maxLLMRetriesLimit = 5
+
+// parseLLMMaxRetries turns the raw MULTICA_LLM_MAX_RETRIES value into the
+// tri-state llm.Config.MaxRetries expects: nil for unset (use the default),
+// llm.Retries(0) to disable retries, llm.Retries(N) for a ceiling of N.
+//
+// Unlike the envFooInt helpers above it returns an error instead of warning and
+// falling back to a default. A retry budget silently corrected to something the
+// operator did not ask for is the failure this knob exists to remove
+// (MUL-6364): a typo'd "3x" or a negative must stop the boot, not quietly
+// restore the default and look configured.
+func parseLLMMaxRetries(raw string) (*llm.RetryOverride, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return nil, fmt.Errorf("must be an integer, got %q", raw)
+	}
+	if v > maxLLMRetriesLimit {
+		return nil, fmt.Errorf("must be at most %d, got %d", maxLLMRetriesLimit, v)
+	}
+	// llm.Retries owns the lower bound. It is the boundary that makes a negative
+	// budget unrepresentable, and this is the only place the server builds one,
+	// so the deployment-specific ceiling above and the type-level floor here
+	// cannot disagree.
+	override, err := llm.Retries(v)
+	if err != nil {
+		return nil, fmt.Errorf("must not be negative, got %d (use 0 to disable retries)", v)
+	}
+	return override, nil
 }
 
 func envPositiveInt64(name string, def int64) int64 {
@@ -249,10 +312,12 @@ func main() {
 	// is the sole broadcaster and the server stays single-node (legacy).
 	// Runtime local-skill stores and realtime relay traffic use separate Redis
 	// clients so blocking stream consumers cannot starve request-path Redis
-	// operations.
+	// operations. Channel leases are initialized separately below so production
+	// can point them at a dedicated no-eviction Redis instance.
 	relayCtx, relayCancel := context.WithCancel(context.Background())
 	var broadcaster realtime.Broadcaster = hub
 	var storeRedis *redis.Client
+	var channelLeaseRedis *redis.Client
 	var relayWriteRedis *redis.Client
 	var relayReadRedis *redis.Client
 	var shardedReadRedis *redis.Client
@@ -270,6 +335,7 @@ func main() {
 		closeRedisClient("realtime-read-sharded", shardedReadRedis)
 		closeRedisClient("realtime-read", relayReadRedis)
 		closeRedisClient("realtime-write", relayWriteRedis)
+		closeRedisClient("channel-lease", channelLeaseRedis)
 		closeRedisClient("store", storeRedis)
 	}()
 	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
@@ -323,6 +389,16 @@ func main() {
 	} else {
 		slog.Info("realtime: REDIS_URL not set — using in-memory hub (single-node mode)")
 	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("CHANNEL_WS_LEASE_BACKEND")), "redis") {
+		leaseRedisURL := channelLeaseRedisURLFromEnv()
+		if leaseRedisURL == "" {
+			slog.Error("channel leases: CHANNEL_WS_LEASE_REDIS_URL and REDIS_URL are unset")
+		} else if opts, err := redis.ParseURL(leaseRedisURL); err != nil {
+			slog.Error("channel leases: invalid Redis URL; supervisor will fail closed", "error", err)
+		} else {
+			channelLeaseRedis = newNamedRedisClient(opts, "channel-lease")
+		}
+	}
 	registerListeners(bus, broadcaster)
 
 	analyticsClient := analytics.NewFromEnv()
@@ -343,6 +419,7 @@ func main() {
 	var businessMetrics *obsmetrics.BusinessMetrics
 	var samplerPool *pgxpool.Pool
 	var channelMediaMetrics *obsmetrics.ChannelMediaReconcilerMetrics
+	var channelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
 	var wecomMetrics *obsmetrics.WecomMetrics
 	if metricsConfig.Enabled() {
 		// Build a dedicated tiny pool for the BusinessSamplerCollector
@@ -372,6 +449,7 @@ func main() {
 		httpMetrics = metricsRegistry.HTTP
 		businessMetrics = metricsRegistry.Business
 		channelMediaMetrics = metricsRegistry.ChannelMedia
+		channelLeaseMetrics = metricsRegistry.ChannelLease
 		wecomMetrics = metricsRegistry.Wecom
 		// Forward inbound daemon WS frames into the per-kind counter so
 		// dashboards can split heartbeat / unknown / invalid traffic.
@@ -396,20 +474,33 @@ func main() {
 	// shutdown so any pending bumps are flushed before we exit.
 	heartbeatScheduler := handler.NewBatchedHeartbeatScheduler(queries, handler.DefaultHeartbeatBatchInterval)
 
+	// Validate the LLM retry budget before the router exists: an operator who
+	// typed a value we cannot honor should see the boot stop, the same way a
+	// malformed feature-flag file does above.
+	llmMaxRetries, err := parseLLMMaxRetries(os.Getenv("MULTICA_LLM_MAX_RETRIES"))
+	if err != nil {
+		slog.Error("invalid MULTICA_LLM_MAX_RETRIES", "error", err)
+		os.Exit(1)
+	}
+
 	r, h := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
-		HTTPMetrics:        httpMetrics,
-		BusinessMetrics:    businessMetrics,
-		WecomMetrics:       wecomMetrics,
-		DaemonHub:          daemonHub,
-		DaemonWakeup:       daemonWakeup,
-		FeatureFlags:       flags,
-		HeartbeatScheduler: heartbeatScheduler,
+		HTTPMetrics:         httpMetrics,
+		BusinessMetrics:     businessMetrics,
+		ChannelLeaseMetrics: channelLeaseMetrics,
+		ChannelLeaseRedis:   channelLeaseRedis,
+		WecomMetrics:        wecomMetrics,
+		DaemonHub:           daemonHub,
+		DaemonWakeup:        daemonWakeup,
+		FeatureFlags:        flags,
+		HeartbeatScheduler:  heartbeatScheduler,
+		LLMMaxRetries:       llmMaxRetries,
 	})
 
 	srv := &http.Server{
 		Addr:    ":" + port,
 		Handler: r,
 	}
+	profilingServer := profiling.NewServer()
 
 	// Start background workers.
 	sweepCtx, sweepCancel := context.WithCancel(context.Background())
@@ -432,9 +523,20 @@ func main() {
 	}
 
 	// Start background sweeper to mark stale runtimes as offline.
-	go runRuntimeSweeper(sweepCtx, pool, queries, liveness, taskSvc, bus)
+	runtimeReconnectGrace := envDuration("MULTICA_RUNTIME_RECONNECT_GRACE", defaultRuntimeReconnectGrace)
+	if runtimeReconnectGrace < minimumRuntimeReconnectGrace {
+		slog.Warn("runtime reconnect grace is shorter than heartbeat freshness; clamping",
+			"configured", runtimeReconnectGrace,
+			"minimum", minimumRuntimeReconnectGrace,
+		)
+		runtimeReconnectGrace = minimumRuntimeReconnectGrace
+	}
+	go runRuntimeSweeper(sweepCtx, pool, queries, liveness, taskSvc, bus, runtimeReconnectGrace)
 	go heartbeatScheduler.Run(sweepCtx)
 	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
+	if autopilotSvc.QuotaEnabled() {
+		go runAutopilotQuotaReconciler(autopilotCtx, autopilotSvc)
+	}
 	go runDBStatsLogger(sweepCtx, pool)
 	if h.WebhookDeliveryWorker != nil {
 		go h.WebhookDeliveryWorker.Run(sweepCtx)
@@ -444,10 +546,10 @@ func main() {
 	h.PRRefresh.Start(sweepCtx)
 
 	// Channel inbound supervisor (MUL-3620): holds the §4.4 WS lease per
-	// installation and drives each channel.Channel. It is built
-	// unconditionally (it is channel-agnostic, not Lark-specific), so it
-	// always exists here; with no platform registered or no installation
-	// rows it simply idles. Lifecycle is bound to sweepCtx so it winds down
+	// installation and drives each channel.Channel. It is channel-agnostic,
+	// not Lark-specific, but remains nil when lease startup validation fails
+	// (notably Redis fail-closed readiness). With no platform registered or no
+	// installation rows it simply idles. Lifecycle is bound to sweepCtx so it winds down
 	// alongside the other long-running workers, AFTER the HTTP server has
 	// drained.
 	if h.ChannelSupervisor != nil {
@@ -501,6 +603,13 @@ func main() {
 			}
 		}()
 	}
+
+	go func() {
+		slog.Info("pprof server starting", "addr", profilingServer.Addr)
+		if err := profilingServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("pprof server disabled after startup error", "error", err)
+		}
+	}()
 
 	go func() {
 		slog.Info("server starting", "port", port)
@@ -575,5 +684,10 @@ func main() {
 		}
 		metricsShutdownCancel()
 	}
+	profilingShutdownCtx, profilingShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := profilingServer.Shutdown(profilingShutdownCtx); err != nil {
+		slog.Error("pprof server forced to shutdown", "error", err)
+	}
+	profilingShutdownCancel()
 	slog.Info("server stopped")
 }

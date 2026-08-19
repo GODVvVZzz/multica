@@ -118,7 +118,7 @@ export function createJaDict(allowSignup: boolean): LandingDict {
           {
             title: "初回起動時に自動検出",
             description:
-              "Multica は Antigravity、Claude Code、CodeBuddy、Codex、Copilot、Cursor、DevEco Code、Grok、Hermes、Kimi、Kiro CLI、Oh-My-Pi、OpenClaw、OpenCode、Pi、Qoder、Qoder CN、Qwen Code、QwenPaw、Reasonix、Trae CLI という21種類の対応ツールをスキャンし、見つかったものをそれぞれランタイムとして登録します。",
+              "Multica は Antigravity、Claude Code、CodeBuddy、Codex、Copilot、Cursor、DeepSeek Harness、DevEco Code、Grok、Hermes、Kimi、Kiro CLI、Oh-My-Pi、OpenClaw、OpenCode、Pi、Qoder、Qoder CN、Qwen Code、QwenPaw、Reasonix、Trae CLI という22種類の対応ツールをスキャンし、見つかったものをそれぞれランタイムとして登録します。",
           },
         ],
       },
@@ -139,7 +139,7 @@ export function createJaDict(allowSignup: boolean): LandingDict {
         {
           title: "CLI をインストールしてマシンを接続",
           description:
-            "multica setup を実行すると、OAuth の手順を案内し、デーモンを起動し、21種類の対応コーディングツール(Antigravity、Claude Code、CodeBuddy、Codex、Copilot、Cursor、DevEco Code、Grok、Hermes、Kimi、Kiro CLI、Oh-My-Pi、OpenClaw、OpenCode、Pi、Qoder、Qoder CN、Qwen Code、QwenPaw、Reasonix、Trae CLI)をスキャンします。すでにインストール済みのものは、自動的にランタイムとして登録されます。",
+            "multica setup を実行すると、OAuth の手順を案内し、デーモンを起動し、22種類の対応コーディングツール(Antigravity、Claude Code、CodeBuddy、Codex、Copilot、Cursor、DeepSeek Harness、DevEco Code、Grok、Hermes、Kimi、Kiro CLI、Oh-My-Pi、OpenClaw、OpenCode、Pi、Qoder、Qoder CN、Qwen Code、QwenPaw、Reasonix、Trae CLI)をスキャンします。すでにインストール済みのものは、自動的にランタイムとして登録されます。",
         },
         {
           title: "最初のエージェントを作成",
@@ -193,7 +193,7 @@ export function createJaDict(allowSignup: boolean): LandingDict {
         {
           question: "Multica はどのコーディングエージェントに対応していますか?",
           answer:
-            "Multica は、Antigravity、Claude Code、CodeBuddy、Codex、Copilot、Cursor、DevEco Code、Grok、Hermes、Kimi、Kiro CLI、Oh-My-Pi、OpenClaw、OpenCode、Pi、Qoder、Qoder CN、Qwen Code、QwenPaw、Reasonix、Trae CLI の21種類のコーディングツールに標準対応しています。デーモンが、すでにインストール済みの CLI を自動検出し、それぞれをランタイムとして登録します。オープンソースなので、独自のバックエンドを追加することもできます。",
+            "Multica は、Antigravity、Claude Code、CodeBuddy、Codex、Copilot、Cursor、DeepSeek Harness、DevEco Code、Grok、Hermes、Kimi、Kiro CLI、Oh-My-Pi、OpenClaw、OpenCode、Pi、Qoder、Qoder CN、Qwen Code、QwenPaw、Reasonix、Trae CLI の22種類のコーディングツールに標準対応しています。デーモンが、すでにインストール済みの CLI を自動検出し、それぞれをランタイムとして登録します。オープンソースなので、独自のバックエンドを追加することもできます。",
         },
         {
           question: "セルフホストが必須ですか、それともクラウド版もありますか?",
@@ -269,6 +269,164 @@ export function createJaDict(allowSignup: boolean): LandingDict {
         fixes: "バグ修正",
       },
       entries: [
+        {
+          version: "0.4.30",
+          date: "2026-08-19",
+          title: "安全な Issue 編集、未設定プロパティの絞り込み、明確なエージェント表示",
+          changes: [],
+          features: [
+            "各チャット セッションを担当するエージェントが分かります。",
+            "ワークスペース管理者は連携済みの DingTalk ID を確認できます。",
+            "値が未設定のカスタム プロパティで Issue を絞り込めます。",
+            "編集中に Issue やコメントが変わっても、保存前に両方の内容を比べられます。",
+          ],
+          improvements: [
+            "コマンド パレットから、すべてのワークスペース ページを開けます。",
+            "チャット セッションの再開が速くなりました。",
+            "Issue のアクティビティ時刻が、意味のある更新を反映します。",
+          ],
+          fixes: [
+            "プライベート エージェントを実行できるのは所有者だけです。",
+            "同時実行中も、エージェントの作業場所が混ざりません。",
+            "プロバイダーのコマンドログに認証情報やプロンプトが出ません。",
+            "コメント送信後に誤って失敗と表示されません。",
+            "依存関係のセキュリティ脆弱性を修正しました。",
+          ],
+        },
+        {
+          version: "0.4.29",
+          date: "2026-08-18",
+          title: "MiniMax Code、実行記録の改善、Hermes エージェントの動作修正",
+          changes: [],
+          features: [
+            "MiniMax Code でエージェントを実行できます。",
+            "Cmd/Ctrl+, で設定をデスクトップの新しいタブに開けます。",
+          ],
+          improvements: [
+            "Hermes エージェントのツール実行中も、実行記録にすぐ表示されます。",
+            "実行記録から重複したエージェント名がなくなり、読みやすくなりました。",
+          ],
+          fixes: [
+            "短い接続切れのあとも、エージェントのタスクが続行されます。",
+            "日次・週次のコスト グラフにキャッシュ読み取り料金が含まれます。",
+            "Feishu で直接送ったファイルと音声がエージェントに届きます。",
+            "委任したタスクが失敗すると、元の調整エージェントに戻ります。",
+            "ダウンロードには最新の完全なリリースだけが表示されます。",
+          ],
+        },
+        {
+          version: "0.4.28",
+          date: "2026-08-17",
+          title:
+            "メンバーのカスタム フィールド、スキルの一括更新、分かりやすいアップデートのお知らせ",
+          changes: [],
+          features: [
+            "カスタム フィールドにワークスペースのメンバーを、1 人でも複数でも入れられます。",
+            "選んだスキルを、元のソースからまとめて一度に更新できます。",
+          ],
+          improvements: [
+            "デスクトップのアップデートのお知らせから、そのバージョンの変更履歴を開けます。",
+            "担当者を指定するところで、メンバーのメール アドレスも使えます。",
+          ],
+          fixes: [
+            "デスクトップで新しいタブを開いても、いまのワークスペースが失われません。",
+            "メンバーの絞り込みが、数だけでなく名前とアバターで表示されます。",
+          ],
+        },
+        {
+          version: "0.4.27",
+          date: "2026-08-17",
+          title:
+            "ワークスペースの MCP サーバー、共有リンク招待、新しい実行記録",
+          changes: [],
+          features: [
+            "MCP サーバーをワークスペースで一度設定し、各エージェントに割り当てられます。",
+            "共有リンクを作って、そのままワークスペースに参加してもらえます。",
+            "実行記録がステップ単位になり、2 レーンのタイムラインと結果の要約が付きます。",
+            "Slack で送られたファイルが、会話の添付として届きます。",
+            "Multica をスマホのホーム画面に追加して、アプリのように開けます。",
+            "ブラウザーのタブに、開いているワークスペースのページ名が出ます。",
+            "インポートしたスキルの入手元が表示されます。",
+            "いま読んでいる Issue へのメンションが「この Issue」と表示されます。",
+          ],
+          improvements: [
+            "動かないエージェント CLI はオフラインになり、直すコマンドを教えてくれます。",
+            "Issue の識別子を入力したときのメンション表示がずっと速くなりました。",
+            "サーバーが複数台でも、チャンネルのメッセージが重複したり抜けたりしません。",
+            "ワークスペースの招待を大量に送れなくなりました。",
+            "エディターの浮動ツールバーがスクリーンリーダーで読めます。",
+          ],
+          fixes: [
+            "デスクトップの起動が失敗しても、開き直せばログインし直す必要がありません。",
+            "最後のワークスペースを削除しても、デスクトップが真っ白になりません。",
+            "Pi がエラーでターンを終えたタスクが、止まらずに失敗として扱われます。",
+            "Antigravity のモデル一覧が読み込めます。",
+            "タブを切り替えても、HTML の添付が読んでいた位置に戻ります。",
+            "カスタム ランタイムの固定引数が、書いた順どおりに渡されます。",
+            "ドラッグを途中でやめても、ボードが固まりません。",
+            "モバイル ウェブでクイック キャプチャーが使えます。",
+            "ページの見出しに、サイドバーの開閉ボタンが二つ出ません。",
+            "エージェントを作るとき、エラーが一瞬光りません。",
+            "実行タイムラインのバーにカーソルを置いても、揺れません。",
+            "セルフホストの更新が途中で止まっても、もう一度実行すれば安全に続きます。",
+          ],
+        },
+        {
+          version: "0.4.26",
+          date: "2026-08-14",
+          title:
+            "DeepSeek Harness ランタイム、ボードのドラッグ移動、Inbox のアーカイブ ショートカット",
+          changes: [],
+          features: [
+            "DeepSeek Harness でエージェントを実行できます。",
+            "ボードの空きスペースをドラッグすると、左右に移動できます。",
+            "Inbox で E を押すと、開いている通知をアーカイブできます。",
+            "セルフホストで、タスクの作業ディレクトリを好きなディスクに置けます。",
+          ],
+          improvements: [
+            "各ページのタイトルとツールバーが、同じ左端にそろいます。",
+            "Codex の最初の応答が遅いとき、待ち時間を長くできます。",
+            "Issue の担当や状態を変えても、新しいタスクを始めないようにできます。",
+          ],
+          fixes: [
+            "動かないエージェント CLI が、直し方を教えてくれます。",
+            "他の人のプライベートなランタイムを、API や CLI から使えなくなりました。",
+            "タスクの残りファイルで、そのフォルダーの multica コマンドが止まりません。",
+            "Volta や Vite Plus で入れたエージェントが認識されます。",
+            "最後の返信と入力欄のあいだの余白が戻りました。",
+            "ダークモードで、アクティブなタブに暗い四角が出ず、ホバーの角も丸く保たれます。",
+            "同じ Issue に、エージェントがもう一つタスクを始めません。",
+          ],
+        },
+        {
+          version: "0.4.25",
+          date: "2026-08-13",
+          title:
+            "ローカル フォルダーの並列モード、DingTalk のグループ振り分け、スキルの更新",
+          changes: [],
+          features: [
+            "ローカル フォルダーでタスクを並列に実行し、それぞれがブランチで成果を返します。",
+            "1 つの DingTalk ボットで、グループごとに別のエージェントを割り当てられます。",
+            "インポートしたスキルを、元のソースからワンクリックで更新できます。",
+            "Issue のメンションにカーソルを置くと、タイトルや担当者、進捗が見えます。",
+            "jcode のエージェントで、思考の深さを選べます。",
+            "セルフホストで、タスクの一時ファイルを大きなディスクに置けます。",
+          ],
+          improvements: [
+            "`multica daemon logs` がログファイルの場所を教えてくれます。",
+            "Hermes のタスクが、読み込んだ HERMES_HOME を示します。",
+          ],
+          fixes: [
+            "オフラインのランタイムを片付けても、タスク履歴が消えません。",
+            "Hermes の会話が、タスクの終了で履歴を失いません。",
+            "npm で入れたエージェントが Windows で起動します。",
+            "Windows で Codex の残りプロセスが居残りません。",
+            "ボードカードのアバターをクリックすると、担当者を変更できます。",
+            "ランタイムの活動とガントの日付が、画面の言語で表示されます。",
+            "ダークモードで、タブとページの境界線の色が変わりません。",
+            "組み込みの Bug トリアージ Autopilot が動くようになりました。",
+          ],
+        },
         {
           version: "0.4.24",
           date: "2026-08-12",

@@ -433,24 +433,56 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// and avoids a conditional that would silently disable cleanup if the
 	// local_directory detection logic ever drifts.
 	manifest := &sidecarManifest{}
+
+	// Arm the rollback BEFORE the first write, not after writeContextFiles
+	// returns. writeContextFiles puts the daemon task marker down as its very
+	// first act and can then fail on any later step — .agent_context, skill
+	// files, project resources — so a defer registered after it returns would
+	// miss exactly the failures that strand a marker with nothing else around
+	// it. Rolling back an empty manifest is a no-op, which is what makes it
+	// safe to arm this early.
+	//
+	// The manifest that records these writes is not persisted until the end of
+	// Prepare, and the caller receives no Environment on any failure path, so
+	// none of the teardown defers that normally undo this tree are ever
+	// registered. Without this rollback the files stay on disk with no record
+	// of what to remove (MUL-6132).
+	//
+	// In place only. Worktree mode discards the whole worktree on failure just
+	// above, and a cloud envRoot is wiped wholesale by the GC — only the
+	// local_directory flow writes into a directory that outlives the task and
+	// belongs to the user, where a leftover marker disables every multica
+	// command in that directory tree until someone removes it by hand.
+	if params.LocalWorkDir != "" {
+		defer func() {
+			if prepareSucceeded {
+				return
+			}
+			if err := rollBackPreparedSidecars(*manifest); err != nil && logger != nil {
+				logger.Warn("execenv: roll back sidecars after failed prepare", "work_dir", workDir, "error", err)
+			}
+		}()
+	}
+
 	if err := writeContextFiles(workDir, params.Provider, params.Task, manifest); err != nil {
 		return nil, fmt.Errorf("execenv: write context files: %w", err)
 	}
 
-	// Persist managed-env provenance for non-local issue envs at Prepare time
+	// Persist managed-env provenance for non-local resumable envs at Prepare time
 	// (not on completion, where .gc_meta.json is written). A same-issue
 	// follow-up can be claimed the instant the prior task completes — before
 	// the prior handler writes .gc_meta.json — so reuse eligibility must be
 	// provable from an artifact that exists the moment the env is created. Only
-	// managed (non-local_directory) issue envs get this marker; that is exactly
-	// the set squad-leader reuse targets (MUL-4886). Non-fatal: a write failure
+	// managed (non-local_directory) issue and chat envs get this marker; that is
+	// exactly the set with a durable conversation scope. Non-fatal: a write failure
 	// only costs the next follow-up its session reuse (it falls back to a fresh
 	// session), which must never block dispatching this task.
-	if params.LocalWorkDir == "" && params.Task.IssueID != "" {
+	if params.LocalWorkDir == "" && (params.Task.IssueID != "" || params.Task.ChatSessionID != "") {
 		if err := WriteManagedEnvProvenance(envRoot, ManagedEnvProvenance{
-			WorkspaceID: params.WorkspaceID,
-			IssueID:     params.Task.IssueID,
-			AgentID:     params.Task.AgentID,
+			WorkspaceID:   params.WorkspaceID,
+			IssueID:       params.Task.IssueID,
+			ChatSessionID: params.Task.ChatSessionID,
+			AgentID:       params.Task.AgentID,
 		}); err != nil && logger != nil {
 			logger.Warn("execenv: write managed env provenance failed (non-fatal); a follow-up may start a fresh session", "error", err)
 		}
@@ -531,6 +563,16 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	}
 
 	if err := writeSidecarManifest(envRoot, manifest); err != nil {
+		// In place the manifest is the ONLY record of what we wrote into the
+		// user's own directory, so losing it strands the sidecar tree there
+		// permanently — no crash required, a disk or permission hiccup is
+		// enough (MUL-6132). Fail so the rollback registered above removes the
+		// tree now, while we still hold the in-memory manifest. Elsewhere the
+		// manifest is a convenience the GC can do without, so a warning stays
+		// the right response.
+		if params.LocalWorkDir != "" {
+			return nil, fmt.Errorf("execenv: write sidecar manifest: %w", err)
+		}
 		logger.Warn("execenv: write sidecar manifest failed (non-fatal)", "error", err)
 	}
 
@@ -543,6 +585,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	if params.Provider == "openclaw" {
 		result, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{
 			OpenclawBin: params.OpenclawBin,
+			CacheDir:    openclawProfileCacheDir(params.Profile, logger),
 			McpConfig:   params.McpConfig,
 			Gateway:     params.OpenclawGateway,
 			Logger:      logger,
@@ -822,6 +865,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	if params.Provider == "openclaw" {
 		result, err := prepareOpenclawConfig(env.RootDir, params.WorkDir, OpenclawConfigPrep{
 			OpenclawBin: params.OpenclawBin,
+			CacheDir:    openclawProfileCacheDir(params.Profile, logger),
 			McpConfig:   params.McpConfig,
 			Gateway:     params.OpenclawGateway,
 			Logger:      logger,
@@ -961,8 +1005,8 @@ const ManagedEnvProvenanceManagedBy = "multica-daemon-managed-env"
 
 // ManagedEnvProvenance is persisted to .managed_env.json inside the env root at
 // Prepare time (NOT on completion, unlike .gc_meta.json). It records that this
-// env root is a daemon-managed, non-local_directory issue env owned by a
-// specific workspace/issue/agent.
+// env root is a daemon-managed, non-local_directory resumable env owned by a
+// specific workspace, conversation scope, and agent.
 //
 // Its whole reason to exist is timing. A squad-leader follow-up on the same
 // issue can be claimed the instant the prior task completes — the server's
@@ -971,18 +1015,19 @@ const ManagedEnvProvenanceManagedBy = "multica-daemon-managed-env"
 // eligibility off .gc_meta.json therefore raced: the successor read a
 // not-yet-written file and started a fresh session (MUL-4886). This marker is
 // on disk from the moment the env is created, so the successor can prove reuse
-// safety inside that window. It is written ONLY for non-local managed issue
-// envs, so its presence is itself the "safe to reuse, not a user
+// safety inside that window. It is written only for non-local managed issue or
+// chat envs, so its presence is itself the "safe to reuse, not a user
 // local_directory" assertion; see shouldReusePriorWorkdir.
 type ManagedEnvProvenance struct {
-	ManagedBy   string `json:"managed_by"`
-	WorkspaceID string `json:"workspace_id"`
-	IssueID     string `json:"issue_id"`
-	AgentID     string `json:"agent_id"`
+	ManagedBy     string `json:"managed_by"`
+	WorkspaceID   string `json:"workspace_id"`
+	IssueID       string `json:"issue_id,omitempty"`
+	ChatSessionID string `json:"chat_session_id,omitempty"`
+	AgentID       string `json:"agent_id"`
 }
 
 // WriteManagedEnvProvenance persists the reuse-eligibility marker at the env
-// root. Callers must only invoke it for non-local_directory issue envs, since
+// root. Callers must only invoke it for non-local_directory resumable envs, since
 // the file's presence is the non-local assertion. ManagedBy is stamped here so
 // callers cannot forget the discriminator.
 func WriteManagedEnvProvenance(envRoot string, p ManagedEnvProvenance) error {

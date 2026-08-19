@@ -22,60 +22,183 @@ import (
 // the rest of the task env.
 const openclawConfigFile = "openclaw-config.json"
 
-// openclawUserSnapshotFile is the sanitized include bridge the wrapper uses
-// when the agent has a managed mcp_config. It composes the user's active
-// config with openclawMcpResetFile, then restores only the resolved non-server
-// MCP settings. The wrapper can therefore add managed `mcp.servers` without
-// deep-merge-by-name leaking user servers.
+// openclawUserSnapshotFile is the sanitized copy of the user's fully
+// resolved openclaw config the wrapper $includes when the agent has a
+// managed mcp_config. It is the user's config minus the `mcp` block so the
+// wrapper's managed `mcp.servers` is the only MCP definition visible to
+// OpenClaw — true strict-replace, not deep-merge-by-name. Lives in envRoot
+// at 0o600 next to the wrapper.
 const openclawUserSnapshotFile = "openclaw-user-snapshot.json"
 
-// openclawMcpResetFile contributes `{"mcp":null}` between the user's config
-// and the sanitized MCP settings. OpenClaw's include merge treats a primitive
-// source as replacement, so this resets the entire user MCP object before the
-// next merge restores the allowed siblings.
+// openclawMcpResetFile contributes `{"mcp":null}` between the user's config and
+// the sanitized MCP settings. OpenClaw's include merge treats a primitive source
+// as replacement, so this resets the entire user MCP object before the next
+// merge restores the allowed siblings.
 const openclawMcpResetFile = "openclaw-mcp-reset.json"
 
-// openclawCLITimeout is the context deadline for OpenClaw discovery commands
-// during task setup (`config file`, `config get agents.list`, and the registry
-// fallback). OpenClaw loads its plugin graph before answering these commands;
-// on a cold Windows host that can take 13-20s, so 30s leaves realistic startup
-// headroom without consuming the preparation step's five-minute hard bound.
+// openclawCLITimeout is the default context deadline set on each
+// `openclaw config ...` invocation during task setup.
 //
-// This deadline is enforceable as of MUL-5467, which is not a given: it was
-// documented here as a known gap for several releases. exec.CommandContext
-// kills only the direct child, and cmd.Output() blocks in Wait() until the
-// output pipes os/exec manages reach EOF — so an openclaw that leaves a
-// descendant holding stdout (its `openclaw-config` helper; on Windows, the
-// cmd.exe → node shim) parked the call for the descendant's lifetime.
+// It used to be 5s, on the assumption that the CLI answers in <200ms and 5s is
+// pure cold-start headroom. Field data (#7112) retired that assumption: on a
+// 2020 Intel MacBook Pro, `openclaw config file` takes 8.4–10.9s and
+// `config get agents.list --json` 4.3s, every time — so the runtime was
+// unusable on that host, with no user-side way to raise the limit. For scale,
+// the same commands take 0.7s / 0.3s on an M-series Mac, i.e. the real spread
+// across supported hardware is wider than the old margin.
+//
+// 30s is ~3x the slowest measured call, and even the worst case
+// (openclawMaxCLICallsPerPreparation serial calls at that budget) fits inside
+// the outer 5-minute task preparation deadline, so a genuinely hung CLI fails
+// with this specific, actionable reason instead of the generic prepare
+// timeout. Hosts outside that envelope can override with
+// MULTICA_OPENCLAW_CLI_TIMEOUT (or backends.openclaw.cli_timeout in the CLI
+// config, which the daemon translates into the same env var).
+//
+// The gap that used to be documented here — that this was a deadline and not a
+// cap — is closed as of MUL-5467. Keeping the measurements, because they are
+// what the fix has to hold against: CommandContext kills only the direct child,
+// and cmd.Output() blocks in Wait() until the stdout pipe closes, so a CLI that
+// leaves a descendant holding stdout ran for the descendant's lifetime.
 // Measured on linux/dash: a shim whose backgrounded child slept 6s took 6.01s
-// against a 150ms deadline. A cmd.WaitDelay backstop bounded the call but left
-// the descendant running, which is why it was reverted from #6084.
+// against a 150ms deadline. An npm shim is that shape on Windows (cmd.exe →
+// node). A cmd.WaitDelay backstop bounded the call but left the descendant
+// running (measured: returns in 2.17s with the grandchild still in state S),
+// trading a hang for a process leak, and on Unix nothing reaped it because
+// preparationProcessController.finish() is a no-op there.
 //
 // execOpenclawCLI now goes through agent.RunCollectQuiet, which owns the pipes
-// (so Wait returns on the direct child's exit) and the process tree (a Unix
-// process group or Windows Job Object), so descendants are reaped rather than
-// orphaned. Production Prepare/Reuse also has an outer isolation boundary
-// around the complete execenv helper before directory ownership is returned.
+// (so Wait returns when the direct child exits, whatever a descendant is holding)
+// and owns the process tree (Unix process group, Windows Job Object), so the
+// descendant is reaped rather than orphaned. The deadline below is therefore
+// enforceable, and a host that needs more of it can say so through the override
+// rather than discovering that the limit was advisory.
 const openclawCLITimeout = 30 * time.Second
 
-// openclawResolvedMcpTimeout remains deliberately shorter. The MCP query runs
-// only after discovery has warmed the CLI and asks for one bounded config
-// subtree; a slow or stuck read must fail closed without spending another full
-// discovery budget on the task's critical path.
+// OpenclawCLITimeoutEnv overrides openclawCLITimeout. Accepts a Go duration
+// ("45s", "2m") or a bare number of seconds ("45"). Values outside
+// [openclawCLIMinTimeout, openclawCLIMaxTimeout] are clamped, and anything
+// unparseable is ignored, so a typo degrades to the default instead of
+// disabling the deadline.
+const OpenclawCLITimeoutEnv = "MULTICA_OPENCLAW_CLI_TIMEOUT"
+
+const (
+	// openclawCLIMinTimeout keeps an override from being so small that no real
+	// CLI can answer; 1s is already below every measured healthy host.
+	openclawCLIMinTimeout = time.Second
+	// openclawCLIMaxTimeout keeps config discovery inside the outer task
+	// preparation budget (daemon.defaultTaskPrepareTimeout, 5 minutes). The
+	// worst case is openclawMaxCLICallsPerPreparation serial calls, so the
+	// ceiling is set so that even then (4 x 60s = 4m) the failure surfaces as a
+	// specific, actionable CLI timeout with room to spare, instead of colliding
+	// with the outer deadline and collapsing into the generic — and retryable —
+	// prepare-timeout reason.
+	openclawCLIMaxTimeout = 60 * time.Second
+)
+
+// openclawMaxCLICallsPerPreparation is how many serial `openclaw ...`
+// invocations one task preparation can make in the worst case. Each one gets
+// its own deadline, so this is the multiplier that decides whether
+// openclawCLIMaxTimeout still fits inside the outer preparation budget.
+//
+// The four call sites, in the order they can fire:
+//
+//  1. `config file`                     — locate the active config
+//  2. `config get agents.list --json`   — pre-2026.6 agents schema
+//  3. `agents list --json`              — 2026.6+ registry fallback, only
+//     reached when (2) reports the config path is missing
+//  4. `config get --json`               — full resolved config, only for an
+//     agent with a managed mcp_config
+//
+// Adding a fifth call means re-deriving the ceiling; the budget test fails
+// loudly if this constant and the real call graph drift apart.
+const openclawMaxCLICallsPerPreparation = 4
+
+// openclawResolvedMcpTimeout is deliberately shorter than the discovery budget.
+// The MCP query runs only after discovery has already warmed the CLI, and asks
+// for one bounded config subtree; a slow or stuck read there must fail closed
+// rather than spend another full discovery budget on the task's critical path.
+// It is counted in openclawMaxCLICallsPerPreparation, so keeping it short only
+// widens the margin that constant protects.
 const openclawResolvedMcpTimeout = 5 * time.Second
 
+// ErrOpenclawCLITimeout marks a task preparation that failed because the local
+// openclaw CLI did not answer within the deadline. It is a sentinel rather
+// than a message-matched string for a reason: the daemon classifies on it
+// structurally (taskRunFailureReason), and the old text-matching path routed
+// every "deadline exceeded" into agent_error.provider_network — telling the
+// user to check their network for a purely local stall, and auto-retrying a
+// failure that is deterministic on the affected host.
+//
+// Preparation runs in a helper process, so the sentinel is re-attached on the
+// daemon side of that boundary; see preparationErrorKindOpenclawCLITimeout.
+var ErrOpenclawCLITimeout = errors.New("openclaw cli timeout")
+
+// openclawCLITimeoutError carries the CLI's own diagnostic text while still
+// matching both ErrOpenclawCLITimeout (our classifier) and the wrapped
+// context error (callers that check cancellation the standard way).
+type openclawCLITimeoutError struct {
+	msg   string
+	cause error
+}
+
+func (e *openclawCLITimeoutError) Error() string { return e.msg }
+
+func (e *openclawCLITimeoutError) Unwrap() []error {
+	return []error{e.cause, ErrOpenclawCLITimeout}
+}
+
+// resolveOpenclawCLITimeout picks the deadline for one CLI invocation:
+// explicit (tests) > MULTICA_OPENCLAW_CLI_TIMEOUT > openclawCLITimeout.
+func resolveOpenclawCLITimeout(explicit time.Duration, logger *slog.Logger) time.Duration {
+	if explicit > 0 {
+		return explicit
+	}
+	raw := strings.TrimSpace(os.Getenv(OpenclawCLITimeoutEnv))
+	if raw == "" {
+		return openclawCLITimeout
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil {
+		// Bare number means seconds. Parsed as a duration string rather than
+		// Atoi * time.Second, which overflows into a negative (or absurdly
+		// large) duration for big inputs instead of failing cleanly.
+		if secondsParsed, secErr := time.ParseDuration(raw + "s"); secErr == nil {
+			parsed, err = secondsParsed, nil
+		}
+	}
+	if err != nil || parsed <= 0 {
+		if logger != nil {
+			logger.Warn("execenv: ignoring unusable openclaw CLI timeout override; using default",
+				"env", OpenclawCLITimeoutEnv, "value", raw, "default", openclawCLITimeout)
+		}
+		return openclawCLITimeout
+	}
+	clamped := min(max(parsed, openclawCLIMinTimeout), openclawCLIMaxTimeout)
+	if clamped != parsed && logger != nil {
+		logger.Warn("execenv: clamping openclaw CLI timeout override",
+			"env", OpenclawCLITimeoutEnv, "value", raw, "applied", clamped)
+	}
+	return clamped
+}
+
 // OpenclawConfigPrep is the input to prepareOpenclawConfig. Only OpenclawBin
-// is meaningful in production — Timeout is here for tests that need a tight
-// deadline to assert error paths.
+// and CacheDir are meaningful in production — Timeout is here for tests that
+// need a tight deadline to assert error paths.
 type OpenclawConfigPrep struct {
 	// OpenclawBin is the openclaw CLI binary to invoke for config introspection.
 	// Empty means resolve "openclaw" from PATH at exec time.
 	OpenclawBin string
-	// Timeout overrides the context deadline for every CLI invocation. It is
-	// not an exact wall-clock cap because bounded collector cleanup follows the
-	// deadline; see agent.RunCollectQuiet.
-	// Zero selects the command-specific production defaults.
+	// Timeout sets the context deadline for each CLI invocation — not a
+	// guaranteed cap on how long the call takes; see openclawCLITimeout. Zero
+	// falls back to the MULTICA_OPENCLAW_CLI_TIMEOUT override, then to
+	// openclawCLITimeout.
 	Timeout time.Duration
+	// CacheDir is the directory holding this daemon profile's shared
+	// discovery cache. Empty disables caching entirely — every task then pays
+	// the full CLI cost, which is correct but slow. See
+	// openclaw_config_cache.go for what is cached and how it is invalidated.
+	CacheDir string
 	// McpConfig is the agent's saved `mcp_config` JSON (Claude-style
 	// `{"mcpServers": {"<name>": {...}}}`). When non-null the wrapper pins
 	// `mcp.servers` to the managed set so OpenClaw resolves MCP from the
@@ -177,9 +300,7 @@ type OpenclawConfigResult struct {
 //  2. Run `openclaw config get agents.list --json` to enumerate every
 //     registered agent ID with its resolved fields. The CLI parses JSON5,
 //     follows $include, and substitutes ${VAR} for us.
-//  3. For managed MCP, resolve only the `mcp` subtree and build an include
-//     bridge that replaces user servers while preserving other MCP settings.
-//  4. Write a wrapper config to envRoot/openclaw-config.json that
+//  3. Write a wrapper config to envRoot/openclaw-config.json that
 //     `$include`s the active path and overrides
 //     `agents.defaults.workspace` plus every `agents.list[].workspace` to
 //     workDir. The original config bytes are not mutated — they are loaded
@@ -222,11 +343,18 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 	if bin == "" {
 		bin = "openclaw"
 	}
-	discoveryTimeout, resolvedMcpTimeout := openclawTimeouts(opts.Timeout)
+	timeout := resolveOpenclawCLITimeout(opts.Timeout, opts.Logger)
+	// The MCP subtree query keeps its own shorter budget; see
+	// openclawResolvedMcpTimeout. An explicit opts.Timeout (tests) still wins so a
+	// test can drive both calls from one knob.
+	resolvedMcpTimeout := openclawResolvedMcpTimeout
+	if opts.Timeout > 0 {
+		resolvedMcpTimeout = opts.Timeout
+	}
 
-	activePath, exists, err := openclawActiveConfigPath(bin, discoveryTimeout)
+	activePath, exists, resolvedList, agentsFromRegistry, cached, err := discoverOpenclawConfig(bin, timeout, opts)
 	if err != nil {
-		return OpenclawConfigResult{}, fmt.Errorf("locate openclaw active config: %w", err)
+		return OpenclawConfigResult{}, err
 	}
 	if !exists && opts.Logger != nil {
 		// Not an error — a genuine fresh install lands here legitimately.
@@ -236,15 +364,6 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 		// and auth profiles.
 		opts.Logger.Warn("execenv: openclaw active config not found; task wrapper will omit $include so the user's models and auth profiles will NOT be visible to this task",
 			"reported_path", activePath)
-	}
-
-	var resolvedList []any
-	var agentsFromRegistry bool
-	if exists {
-		resolvedList, agentsFromRegistry, err = openclawResolvedAgentsList(bin, discoveryTimeout)
-		if err != nil {
-			return OpenclawConfigResult{}, fmt.Errorf("read openclaw agents.list: %w", err)
-		}
 	}
 
 	// Parse the agent's managed mcp_config (if any) before writing the wrapper
@@ -261,17 +380,25 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 	// **Strict replace for managed mcp_config.** When the agent has a managed
 	// set, deep-merging the wrapper's `mcp.servers` against the user's active
 	// config via `$include` would let user-only entries leak in (and an empty
-	// managed set would not actually clear inherited servers). OpenClaw no
-	// longer supports reading the resolved config root, but it does support
-	// `config get mcp --json`. Build a three-stage include instead:
+	// managed set would not actually clear inherited servers).
+	//
+	// Current OpenClaw releases reject the resolved-root form this used to use
+	// (`config get --json` with no path): measured against 2026.5.27 it produces
+	// zero bytes on stdout and never exits, and the same shape is reported on
+	// 2026.7.1-2. `config get mcp --json` is supported, so build a three-stage
+	// include instead:
 	//
 	//  1. include the user's full config,
-	//  2. merge `mcp: null` to replace its MCP object,
-	//  3. restore the resolved non-server MCP settings.
+	//  2. merge `mcp: null` to replace its MCP object wholesale,
+	//  3. restore the resolved non-server MCP settings (`sessionIdleTtlMs` and
+	//     friends).
 	//
-	// The final wrapper then adds the managed server set. OpenClaw's own loader
-	// still resolves JSON5, nested includes, and env substitutions; user config
-	// bytes and secrets are never copied into the task directory.
+	// The wrapper then adds the managed server set, which becomes the only MCP
+	// server definition the snapshot can yield, while the user's surrounding
+	// `mcp` tuning still flows through. OpenClaw's own loader resolves JSON5,
+	// nested includes and env substitutions behind the include, so — unlike the
+	// flat resolved-config snapshot this replaces — no user config bytes, API
+	// keys or provider tokens are ever copied into the task directory.
 	snapshotPath := ""
 	if hasManagedMcp && exists {
 		resolvedMcp, ferr := openclawResolvedMcpConfig(bin, resolvedMcpTimeout)
@@ -295,6 +422,9 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 			return OpenclawConfigResult{}, fmt.Errorf("marshal openclaw user snapshot: %w", merr)
 		}
 		snapshotPath = filepath.Join(envRoot, openclawUserSnapshotFile)
+		// 0o600 even though the snapshot holds only include paths and MCP
+		// tuning: it names the user's real config location, and nothing outside
+		// the openclaw child needs to read it.
 		if werr := os.WriteFile(snapshotPath, snapBytes, 0o600); werr != nil {
 			return OpenclawConfigResult{}, fmt.Errorf("write openclaw user snapshot: %w", werr)
 		}
@@ -316,8 +446,9 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 	result := OpenclawConfigResult{ConfigPath: outPath}
 	includeTarget := "none"
 	if snapshotPath != "" {
-		// The snapshot lives beside the wrapper but includes the live user
-		// config, so grant that cross-directory hop to OpenClaw's nested
+		// The snapshot lives beside the wrapper, but unlike the flat resolved
+		// copy it replaces it $includes the live user config, so that
+		// cross-directory hop still has to be granted to OpenClaw's nested
 		// include resolver.
 		result.IncludeRoot = filepath.Dir(activePath)
 		includeTarget = "sanitized-snapshot"
@@ -334,16 +465,58 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 			"include_target", includeTarget,
 			"include_root", result.IncludeRoot,
 			"agents_from_registry", agentsFromRegistry,
+			"discovery_cached", cached,
 			"managed_mcp", hasManagedMcp)
 	}
 	return result, nil
 }
 
-func openclawTimeouts(override time.Duration) (discovery, resolvedMcp time.Duration) {
-	if override > 0 {
-		return override, override
+// discoverOpenclawConfig resolves the user's active config path and resolved
+// agents.list, serving both from the shared per-profile cache when the cached
+// evidence still matches the host (see openclaw_config_cache.go).
+//
+// The two are cached as one unit because they are read as one unit: a hit that
+// covered only the path would still pay the second CLI call, which on the host
+// in #7112 is 4.3s of the 12.7s total.
+//
+// Cache faults are never fatal. A miss, an unreadable entry, or a failed store
+// only costs the CLI round-trips this call was going to make anyway, so
+// discovery keeps its existing fail-closed contract: only a real CLI failure
+// fails the task.
+func discoverOpenclawConfig(bin string, timeout time.Duration, opts OpenclawConfigPrep) (activePath string, exists bool, resolvedList []any, agentsFromRegistry bool, cached bool, err error) {
+	cachePath := openclawDiscoveryCachePath(opts.CacheDir)
+	if entry, ok := loadOpenclawDiscoveryCache(cachePath, bin, time.Now()); ok {
+		list, decodeErr := decodeOpenclawCachedAgentsList(entry.AgentsList)
+		if decodeErr == nil {
+			return entry.ActiveConfigPath, true, list, entry.AgentsFromRegistry, true, nil
+		}
+		if opts.Logger != nil {
+			opts.Logger.Warn("execenv: openclaw discovery cache entry unusable; rediscovering",
+				"cache", cachePath, "error", decodeErr)
+		}
 	}
-	return openclawCLITimeout, openclawResolvedMcpTimeout
+
+	activePath, exists, err = openclawActiveConfigPath(bin, timeout)
+	if err != nil {
+		return "", false, nil, false, false, fmt.Errorf("locate openclaw active config: %w", err)
+	}
+	if !exists {
+		// Deliberately not cached: "no config on disk" is the one state that
+		// flips the moment the user runs OpenClaw's own setup, and caching it
+		// would keep a freshly configured host running without its models and
+		// auth profiles for the rest of the TTL.
+		return activePath, false, nil, false, false, nil
+	}
+
+	resolvedList, agentsFromRegistry, err = openclawResolvedAgentsList(bin, timeout)
+	if err != nil {
+		return "", false, nil, false, false, fmt.Errorf("read openclaw agents.list: %w", err)
+	}
+	if storeErr := storeOpenclawDiscoveryCache(cachePath, bin, activePath, resolvedList, agentsFromRegistry, time.Now()); storeErr != nil && opts.Logger != nil {
+		opts.Logger.Warn("execenv: could not cache openclaw discovery; next task will rerun the CLI",
+			"cache", cachePath, "error", storeErr)
+	}
+	return activePath, exists, resolvedList, agentsFromRegistry, false, nil
 }
 
 // buildPerTaskOpenclawConfig assembles the wrapper map that goes on disk.
@@ -362,18 +535,18 @@ func openclawTimeouts(override time.Duration) (discovery, resolvedMcp time.Durat
 // $include here, so this is not the silent-fallback case the reviewer
 // flagged.
 //
-// snapshotPath, when non-empty, points at the sanitized include bridge in
-// envRoot. It is the $include target whenever the agent has a managed
-// mcp_config; the bridge still references the live user file for all non-MCP
-// config but resets its MCP object before restoring allowed settings. When
-// snapshotPath is empty the wrapper falls back to $include'ing the active path
-// directly (no managed MCP means there is nothing to enforce strictness
-// against).
+// snapshotPath, when non-empty, points at a sanitized copy of the user's
+// resolved config (mcp stripped) sitting in envRoot. It is the $include
+// target whenever the agent has a managed mcp_config — the live user file
+// would otherwise leak global `mcp.servers` past the wrapper. When
+// snapshotPath is empty the wrapper falls back to $include'ing the active
+// path so secrets / nested includes stay in the user's own file (no
+// managed mcp means there is nothing to enforce strictness against).
 //
 // hasManagedMcp distinguishes "agent has a managed mcp_config (possibly an
 // empty set)" from "agent inherits the user's global mcp.servers". When
 // true we pin `mcp.servers` to managedMcp on the wrapper. Because the
-// snapshot $include has already replaced the user's `mcp` block, the
+// snapshot $include has already dropped the user's `mcp` block, the
 // resulting view of `mcp.servers` is exactly the managed set — including
 // `{}` for "admin saved no servers" (mirrors `hasManagedCodexMcpConfig`).
 func buildPerTaskOpenclawConfig(activePath string, exists bool, snapshotPath string, resolvedList []any, agentsFromRegistry bool, workDir string, managedMcp map[string]any, hasManagedMcp bool, gateway OpenclawGatewayPin) map[string]any {
@@ -524,7 +697,15 @@ func openclawActiveConfigPath(bin string, timeout time.Duration) (string, bool, 
 func openclawParseActiveConfigPath(out string) (string, bool, error) {
 	// OpenClaw may print terminal UI borders (e.g., Doctor warnings) before
 	// the actual path. The path is always the last non-empty line.
-	path := openclawLastNonEmptyLine(out)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	path := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed != "" {
+			path = trimmed
+			break
+		}
+	}
 	if path == "" {
 		return "", false, fmt.Errorf("`openclaw config file` returned empty output")
 	}
@@ -534,62 +715,6 @@ func openclawParseActiveConfigPath(out string) (string, bool, error) {
 		return "", false, err
 	}
 	return openclawStatConfigPath(path)
-}
-
-// openclawLastNonEmptyLine returns the last non-empty, trimmed line of out.
-// Shared by the parser and by openclawConfigPathComplete so the two cannot
-// disagree about which line carries the answer.
-func openclawLastNonEmptyLine(out string) string {
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
-
-// openclawOutputComplete returns the rule that decides whether the bytes
-// captured so far are a finished answer for this openclaw subcommand, for
-// agent.RunCollectQuiet's early return.
-//
-// A nil result means "no rule for this shape", which makes RunCollectQuiet wait
-// for the process to exit — the conservative behaviour. Adding a subcommand
-// without a rule therefore loses the hang tolerance rather than risking a
-// truncated answer.
-func openclawOutputComplete(args []string) agent.OutputComplete {
-	for _, a := range args {
-		if a == "--json" {
-			return agent.JSONOutputComplete
-		}
-	}
-	if len(args) >= 2 && args[0] == "config" && args[1] == "file" {
-		return openclawConfigPathComplete
-	}
-	return nil
-}
-
-// openclawConfigPathComplete reports whether out already carries a usable
-// `openclaw config file` answer, i.e. its last non-empty line looks like a path.
-//
-// Deliberately stricter than openclawParseActiveConfigPath, which resolves a
-// relative line through filepath.Abs and would therefore accept a Doctor warning
-// border as an answer. That leniency is fine once the command has finished, but
-// as a completeness rule it would let the early return fire on the banner
-// OpenClaw prints *before* the path (see MUL-3136) and return the banner as the
-// config path.
-func openclawConfigPathComplete(out []byte) bool {
-	line := openclawLastNonEmptyLine(string(out))
-	if line == "" {
-		return false
-	}
-	if _, isTilde := openclawTildeRest(line); isTilde {
-		return true
-	}
-	if _, isOpenclawHome := openclawHomeRest(line); isOpenclawHome {
-		return filepath.IsAbs(strings.TrimSpace(os.Getenv("OPENCLAW_HOME")))
-	}
-	return filepath.IsAbs(line)
 }
 
 func openclawFallbackActiveConfigPath() (string, bool, error) {
@@ -789,13 +914,17 @@ func isOpenclawConfigFileUnsupported(err error) bool {
 		(strings.Contains(msg, "unknown") && strings.Contains(msg, "config") && strings.Contains(msg, "file"))
 }
 
-// openclawResolvedMcpConfig fetches the user's fully resolved `mcp` subtree.
-// The CLI handles JSON5, nested includes, and env substitution. Reading only
-// this path is intentional: OpenClaw 2026.7 requires a path for `config get`,
-// so the former root `config get --json` invocation is no longer valid.
+// openclawResolvedMcpConfig reads the user's resolved `mcp` subtree.
 //
-// Returns (nil, nil) when the key is absent or the CLI prints empty/null. Any
-// other failure surfaces so managed MCP remains fail closed.
+// `config get mcp --json` rather than the resolved root (`config get --json`,
+// no path): current OpenClaw releases do not answer the root form. Measured
+// against 2026.5.27 it writes nothing to stdout and never exits, so the root
+// form turns every managed-mcp task into a preparation timeout; the same shape
+// is reported against 2026.7.1-2. Asking for the subtree we actually need also
+// keeps the user's API keys and provider tokens out of this process entirely.
+//
+// A missing key is not an error: an OpenClaw config with no `mcp` block at all
+// answers "path not found", which means there is nothing to preserve.
 func openclawResolvedMcpConfig(bin string, timeout time.Duration) (map[string]any, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -804,7 +933,7 @@ func openclawResolvedMcpConfig(bin string, timeout time.Duration) (map[string]an
 		if isOpenclawKeyMissing(err) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, annotateOpenclawJSONError(err, out)
 	}
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" || trimmed == "null" {
@@ -839,13 +968,13 @@ func openclawResolvedAgentsList(bin string, timeout time.Duration) ([]any, bool,
 	defer cancel()
 	out, err := openclawExec(ctx, bin, "config", "get", "agents.list", "--json")
 	if err != nil {
-		if isOpenclawKeyMissing(err) {
+		if isOpenclawKeyMissingResult(out, err) {
 			// New schema: the config path is gone; the agents live in the
 			// sqlite registry. Resolve them via the subcommand instead.
 			list, rerr := openclawRegistryAgentsList(bin, timeout)
 			return list, true, rerr
 		}
-		return nil, false, err
+		return nil, false, annotateOpenclawJSONError(err, out)
 	}
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" || trimmed == "null" {
@@ -889,7 +1018,7 @@ func openclawRegistryAgentsList(bin string, timeout time.Duration) ([]any, error
 		if isOpenclawKeyMissing(err) || isOpenclawUnknownSubcommand(err) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, annotateOpenclawJSONError(err, out)
 	}
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" || trimmed == "null" {
@@ -907,7 +1036,67 @@ func openclawRegistryAgentsList(bin string, timeout time.Duration) ([]any, error
 // to avoid spawning a real binary. Production code never reassigns it.
 var openclawExec = execOpenclawCLI
 
-// execOpenclawCLI executes an openclaw subcommand and returns its stdout.
+// openclawLastNonEmptyLine returns the last non-empty, trimmed line of out.
+// Shared by the parser and by openclawConfigPathComplete so the two cannot
+// disagree about which line carries the answer.
+func openclawLastNonEmptyLine(out string) string {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// openclawConfigPathComplete reports whether out already carries a usable
+// `openclaw config file` answer, i.e. its last non-empty line looks like a path.
+//
+// Deliberately stricter than the parser, which resolves a relative line through
+// filepath.Abs and would therefore accept a Doctor warning border as an answer.
+// That leniency is fine once the command has finished; as a completeness rule it
+// would let the early return fire on the banner OpenClaw prints *before* the
+// path. Measured on 2026.5.27: the banner lands 54ms ahead of the path.
+func openclawConfigPathComplete(out []byte) bool {
+	line := openclawLastNonEmptyLine(string(out))
+	if line == "" {
+		return false
+	}
+	if _, isTilde := openclawTildeRest(line); isTilde {
+		return true
+	}
+	if _, isOpenclawHome := openclawHomeRest(line); isOpenclawHome {
+		return filepath.IsAbs(strings.TrimSpace(os.Getenv("OPENCLAW_HOME")))
+	}
+	return filepath.IsAbs(line)
+}
+
+// openclawOutputComplete returns the rule that decides whether the bytes
+// captured so far are a finished answer for this openclaw subcommand, for
+// agent.RunCollectQuiet's early return.
+//
+// A nil result means "no rule for this shape", which makes RunCollectQuiet wait
+// for the process to exit — the conservative behaviour. Adding a subcommand
+// without a rule therefore loses the hang tolerance rather than risking a
+// truncated answer.
+func openclawOutputComplete(args []string) agent.OutputComplete {
+	for _, a := range args {
+		if a == "--json" {
+			return agent.JSONOutputComplete
+		}
+	}
+	if len(args) >= 2 && args[0] == "config" && args[1] == "file" {
+		return openclawConfigPathComplete
+	}
+	return nil
+}
+
+// execOpenclawCLI executes an openclaw subcommand and returns its stdout,
+// including stdout captured before a non-zero exit. Failed stdout stays in the
+// separate return value and this execution layer never appends it to the error:
+// config commands can print resolved configuration and secrets there. JSON
+// callers may extract only a bounded error-envelope field through
+// annotateOpenclawJSONError; arbitrary failed stdout remains non-diagnostic.
 // The daemon's environment is inherited so OPENCLAW_CONFIG_PATH /
 // OPENCLAW_STATE_DIR / OPENCLAW_HOME / OPENCLAW_INCLUDE_ROOTS pass through.
 //
@@ -931,35 +1120,57 @@ var openclawExec = execOpenclawCLI
 // error, so errors.Is(err, context.DeadlineExceeded) holds for callers that
 // check cancellation the standard way. The process error is still printed for
 // diagnosis, just not as the wrapped cause.
-//
-// The invocation goes through agent.RunCollectQuiet rather than cmd.Output(),
-// which closes the gap openclawCLITimeout documents (MUL-5467) and tolerates an
-// openclaw that prints its answer and then declines to exit. Both are
-// openclaw-side misbehaviour we cannot fix from here, and neither should stop a
-// chat task from starting. See server/pkg/agent/run_collect.go.
-//
-// The completeness rule is per-subcommand (openclawOutputComplete): the runner
-// must never treat "some output arrived" as "the answer arrived", or a response
-// still streaming when the deadline hits would be reported as success.
 func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, error) {
-	raw, stderr, _, err := agent.RunCollectQuiet(ctx, os.Environ(), 0, openclawOutputComplete(args), bin, args...)
+	// agent.RunCollectQuiet, not cmd.Output(): this package owns the pipes and
+	// the process tree, which is what makes the deadline above enforceable at all
+	// (MUL-5467 — see openclawCLITimeout). The per-subcommand rule from
+	// openclawOutputComplete additionally lets a CLI that prints its answer and
+	// then refuses to exit be treated as finished, so `openclaw config file` no
+	// longer has to reach the deadline to be useful.
+	//
+	// Every error shape below is unchanged, including returning captured stdout
+	// alongside the error: annotateOpenclawJSONError reads it, and the typed
+	// timeout sentinel is what lets the daemon classify a local stall
+	// structurally.
+	raw, stderrOut, _, err := agent.RunCollectQuiet(ctx, os.Environ(), 0, openclawOutputComplete(args), bin, args...)
+	stdout := string(raw)
 	if err != nil {
-		stderrMsg := strings.TrimSpace(stderr)
+		stderrMsg := strings.TrimSpace(stderrOut)
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			msg := fmt.Sprintf("openclaw %s: %v (process: %v)", strings.Join(args, " "), ctxErr, err)
 			if stderrMsg != "" {
-				return "", fmt.Errorf("openclaw %s: %w (process: %v; stderr: %s)", strings.Join(args, " "), ctxErr, err, stderrMsg)
+				msg = fmt.Sprintf("openclaw %s: %v (process: %v; stderr: %s)", strings.Join(args, " "), ctxErr, err, stderrMsg)
 			}
-			return "", fmt.Errorf("openclaw %s: %w (process: %v)", strings.Join(args, " "), ctxErr, err)
+			// A deadline is reported through openclawCLITimeoutError so the
+			// daemon can recognise a local CLI stall structurally
+			// (ErrOpenclawCLITimeout) instead of string-matching "deadline
+			// exceeded" — which routed it into agent_error.provider_network,
+			// i.e. "check your network" copy plus an auto-retry, for a failure
+			// that is local and deterministic.
+			//
+			// Cancellation deliberately does NOT get the sentinel: a daemon
+			// shutdown or a cancelled task is not a slow CLI, and labelling it
+			// as one would tell the user to raise a timeout that was never the
+			// problem. Both keep the wrapped context error, so
+			// errors.Is(err, context.DeadlineExceeded) / context.Canceled work
+			// exactly as before.
+			if errors.Is(ctxErr, context.DeadlineExceeded) {
+				return stdout, &openclawCLITimeoutError{msg: msg, cause: ctxErr}
+			}
+			if stderrMsg != "" {
+				return stdout, fmt.Errorf("openclaw %s: %w (process: %v; stderr: %s)", strings.Join(args, " "), ctxErr, err, stderrMsg)
+			}
+			return stdout, fmt.Errorf("openclaw %s: %w (process: %v)", strings.Join(args, " "), ctxErr, err)
 		}
 		if stderrMsg != "" {
-			return "", fmt.Errorf("openclaw %s: %w (stderr: %s)", strings.Join(args, " "), err, stderrMsg)
+			return stdout, fmt.Errorf("openclaw %s: %w (stderr: %s)", strings.Join(args, " "), err, stderrMsg)
 		}
 		if diag := openclawShimDiagnostic(bin, err); diag != "" {
-			return "", fmt.Errorf("openclaw %s: %w (%s)", strings.Join(args, " "), err, diag)
+			return stdout, fmt.Errorf("openclaw %s: %w (%s)", strings.Join(args, " "), err, diag)
 		}
-		return "", fmt.Errorf("openclaw %s: %w", strings.Join(args, " "), err)
+		return stdout, fmt.Errorf("openclaw %s: %w", strings.Join(args, " "), err)
 	}
-	return string(raw), nil
+	return stdout, nil
 }
 
 // openclawManagedMcpServers parses the agent's `mcp_config` JSON and returns
@@ -1026,6 +1237,68 @@ func isOpenclawKeyMissing(err error) bool {
 	if err == nil {
 		return false
 	}
+	return isOpenclawKeyMissingMessage(err.Error())
+}
+
+const openclawJSONErrorMaxRunes = 1024
+
+func openclawJSONErrorMessage(stdout string) (string, bool) {
+	var envelope struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(stdout)), &envelope) != nil {
+		return "", false
+	}
+	message := strings.Join(strings.Fields(envelope.Error), " ")
+	return message, message != ""
+}
+
+// annotateOpenclawJSONError restores diagnostics for JSON-mode commands whose
+// CLI errors are written to stdout. Only the envelope's `error` string is
+// included: sibling fields may contain resolved configuration or secrets. The
+// message is whitespace-normalized for single-line logs and rune-bounded to
+// keep persisted task errors finite while preserving valid UTF-8.
+func annotateOpenclawJSONError(err error, stdout string) error {
+	if err == nil {
+		return nil
+	}
+	message, ok := openclawJSONErrorMessage(stdout)
+	if !ok {
+		return err
+	}
+	runes := []rune(message)
+	if len(runes) > openclawJSONErrorMaxRunes {
+		message = string(runes[:openclawJSONErrorMaxRunes]) + "…"
+	}
+	return fmt.Errorf("%w (json error: %s)", err, message)
+}
+
+// isOpenclawKeyMissingResult recognizes the JSON error envelope observed in
+// OpenClaw 2026.7.2-beta.7 for `config get ... --json` failures. It first
+// preserves the historical stderr/error-text matching, then parses only the
+// explicit `error` field and requires it to name agents.list; broad historical
+// phrases such as "not set" cannot reclassify an unrelated structured error.
+// Cancellation and timeout keep their original meaning even if a child emitted
+// a partial missing-path envelope before it stopped.
+func isOpenclawKeyMissingResult(stdout string, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if isOpenclawKeyMissing(err) {
+		return true
+	}
+	message, ok := openclawJSONErrorMessage(stdout)
+	if !ok {
+		return false
+	}
+	return strings.Contains(strings.ToLower(message), "agents.list") &&
+		isOpenclawKeyMissingMessage(message)
+}
+
+func isOpenclawKeyMissingMessage(msg string) bool {
 	// Match case-insensitively: the CLI's "key not found" wording has drifted
 	// across versions and capitalization is not stable. Pre-2026.6 emitted
 	// "Path not found"; OpenClaw 2026.6.x emits "Config path not found:
@@ -1033,7 +1306,7 @@ func isOpenclawKeyMissing(err error) bool {
 	// strings.Contains on "Path not found" silently stopped matching the
 	// 2026.6.x string, turning the intended graceful-skip into a fail-closed
 	// error that broke every OpenClaw 2026.6.x runtime (see upstream #3028).
-	msg := strings.ToLower(err.Error())
+	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "no value at ") ||
 		strings.Contains(msg, "not set") ||
 		strings.Contains(msg, "missing key") ||

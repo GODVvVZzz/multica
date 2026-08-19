@@ -97,8 +97,15 @@ type collector struct {
 	finishOnce sync.Once
 }
 
-func startCollector(ctx context.Context, env []string, execPath string, args ...string) (*collector, error) {
-	cmd := exec.CommandContext(ctx, execPath, args...)
+// startCollector takes a *exec.Cmd the caller has already built rather than an
+// executable path, so a launch that carries an argv prefix (Command.exec, which
+// applies a custom runtime's fixed_args) keeps it. Building the command here
+// would silently drop that prefix.
+//
+// The caller must not have started it, and must leave Stdout/Stderr unset: this
+// package installs its own *os.File pipes, which is the whole reason Wait cannot
+// be held hostage by a descendant.
+func startCollector(ctx context.Context, cmd *exec.Cmd, env []string) (*collector, error) {
 	if env != nil {
 		cmd.Env = env
 	}
@@ -267,7 +274,16 @@ func (c *collector) exitErr() (error, bool) {
 // their own lifecycle. Use this for one-shot, read-only invocations
 // (`--version`, `agents list`, `config get`).
 func RunCollect(ctx context.Context, env []string, execPath string, args ...string) (stdout []byte, stderr string, err error) {
-	c, startErr := startCollector(ctx, env, execPath, args...)
+	// Command.exec, not exec.CommandContext: launch.go owns process construction
+	// so a custom runtime's fixed_args prefix cannot be dropped (GH #7046). A zero
+	// Command has no prefix, which is what a bare path argument means here.
+	return RunCollectCmd(ctx, Command{Path: execPath}.exec(ctx, args...), env)
+}
+
+// RunCollectCmd is RunCollect for a caller that already holds a *exec.Cmd, which
+// is what Command.exec returns.
+func RunCollectCmd(ctx context.Context, cmd *exec.Cmd, env []string) (stdout []byte, stderr string, err error) {
+	c, startErr := startCollector(ctx, cmd, env)
 	if startErr != nil {
 		return nil, "", startErr
 	}

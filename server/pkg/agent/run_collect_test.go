@@ -66,7 +66,7 @@ func TestCheckOpenclawVersionReapsPipeHoldingGrandchild(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := checkOpenclawVersion(ctx, cli); err != nil {
+	if err := checkOpenclawVersion(ctx, Command{Path: cli}); err != nil {
 		t.Fatalf("checkOpenclawVersion: %v", err)
 	}
 
@@ -208,7 +208,7 @@ func TestDetectCLIVersionReapsForkedHelper(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "helper.pid")
 	cli := writeForkingCLI(t, pidFile)
 
-	version, err := detectCLIVersion(context.Background(), cli)
+	version, err := detectCLIVersion(context.Background(), Command{Path: cli})
 	if err != nil {
 		t.Fatalf("detectCLIVersion: %v", err)
 	}

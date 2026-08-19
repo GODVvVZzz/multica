@@ -197,6 +197,22 @@ UPDATE agent_runtime
 SET status = 'offline', updated_at = now()
 WHERE id = $1;
 
+-- name: SetAgentRuntimeOfflineWithReason :exec
+-- Takes a runtime offline and records WHY, for the one class of cause the user
+-- has to repair before the runtime can come back (MUL-6164). Everything that
+-- merely stops — daemon shutdown, laptop asleep — uses SetAgentRuntimeOffline
+-- and leaves no reason, because "wait for it" needs no explanation.
+--
+-- Merged into metadata rather than a column: registration overwrites metadata
+-- wholesale (`metadata = EXCLUDED.metadata`), so a runtime that comes back
+-- drops the reason as a side effect of being usable again — there is no stale
+-- explanation to clean up and no code path that has to remember to clear it.
+UPDATE agent_runtime
+SET status = 'offline',
+    metadata = metadata || jsonb_build_object('offline_reason', @offline_reason::jsonb),
+    updated_at = now()
+WHERE id = $1;
+
 -- name: SelectStaleOnlineRuntimes :many
 -- Lists online runtimes whose last_seen_at exceeds the stale window. The
 -- sweeper uses this as a candidate set, then optionally filters via the
@@ -227,17 +243,33 @@ RETURNING id, workspace_id, owner_id, daemon_id, provider;
 
 -- name: FailTasksForOfflineRuntimes :many
 -- Marks dispatched/running/waiting_local_directory tasks as failed when
--- their runtime is offline. This cleans up orphaned tasks after a daemon
--- crash or network partition.
-UPDATE agent_task_queue
+-- their runtime has remained offline beyond the reconnect grace. A short or
+-- medium network partition must not terminate a daemon process that is still
+-- running locally; a real daemon restart is recovered separately through
+-- RecoverOrphanedTasksForRuntime. Bounded per tick so a large recovery backlog
+-- cannot monopolise the sweeper transaction. last_seen_at is normally set by
+-- the first heartbeat; updated_at is only the fallback for a never-heartbeated
+-- runtime, and a forced-offline write starts its grace from that update.
+WITH victims AS (
+  SELECT task.id
+  FROM agent_task_queue task
+  JOIN agent_runtime runtime ON runtime.id = task.runtime_id
+  WHERE task.status IN ('dispatched', 'running', 'waiting_local_directory')
+    AND runtime.status = 'offline'
+    AND COALESCE(runtime.last_seen_at, runtime.updated_at) <
+        now() - make_interval(secs => @reconnect_grace_secs::double precision)
+  ORDER BY COALESCE(runtime.last_seen_at, runtime.updated_at), task.created_at
+  LIMIT @max_per_tick::int
+  FOR UPDATE OF task SKIP LOCKED
+)
+UPDATE agent_task_queue AS task
 SET status = 'failed', completed_at = now(), error = 'runtime went offline',
     failure_reason = 'runtime_offline',
     wait_reason = NULL
-WHERE status IN ('dispatched', 'running', 'waiting_local_directory')
-  AND runtime_id IN (
-    SELECT id FROM agent_runtime WHERE status = 'offline'
-  )
-RETURNING *;
+FROM victims
+WHERE task.id = victims.id
+  AND task.status IN ('dispatched', 'running', 'waiting_local_directory')
+RETURNING task.*;
 
 -- name: ListAgentRuntimesByOwner :many
 SELECT * FROM agent_runtime

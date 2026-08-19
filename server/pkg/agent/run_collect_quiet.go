@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os/exec"
 	"time"
 )
 
@@ -96,11 +97,18 @@ func JSONOutputComplete(stdout []byte) bool {
 // Anything that streams incrementally (agent execution) must keep its own
 // lifecycle handling, where a pause in output carries meaning.
 func RunCollectQuiet(ctx context.Context, env []string, idleGrace time.Duration, complete OutputComplete, execPath string, args ...string) (stdout []byte, stderr string, quiet bool, err error) {
+	// Command.exec for the same reason as RunCollect; see the note there.
+	return RunCollectQuietCmd(ctx, Command{Path: execPath}.exec(ctx, args...), env, idleGrace, complete)
+}
+
+// RunCollectQuietCmd is RunCollectQuiet for a caller that already holds a
+// *exec.Cmd, which is what Command.exec returns.
+func RunCollectQuietCmd(ctx context.Context, cmd *exec.Cmd, env []string, idleGrace time.Duration, complete OutputComplete) (stdout []byte, stderr string, quiet bool, err error) {
 	if idleGrace <= 0 {
 		idleGrace = DefaultQuietIdleGrace
 	}
 
-	c, startErr := startCollector(ctx, env, execPath, args...)
+	c, startErr := startCollector(ctx, cmd, env)
 	if startErr != nil {
 		return nil, "", false, startErr
 	}

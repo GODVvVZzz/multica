@@ -23,10 +23,12 @@ import type { AgentTask, Issue } from "@multica/core/types";
 import { todayDateOnly, addDaysDateOnly } from "@multica/core/issues/date";
 import { api } from "@multica/core/api";
 import {
-  ALL_STATUSES,
   PRIORITY_DISPLAY_ORDER,
   PRIORITY_CONFIG,
 } from "@multica/core/issues/config";
+import { useWorkspaceId } from "@multica/core/hooks";
+import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
+import { useStatusOptions } from "../utils/status-options";
 import { issueKeys } from "@multica/core/issues/queries";
 import { StatusIcon } from "../components/status-icon";
 import { PriorityIcon } from "../components/priority-icon";
@@ -46,6 +48,7 @@ import {
 } from "@multica/ui/components/ui/context-menu";
 import { copyText } from "@multica/ui/lib/clipboard";
 import type { UseIssueActionsResult } from "./use-issue-actions";
+import { PluginHookMenuItems, PluginModalMenuItems } from "../../plugins";
 import { useT } from "../../i18n";
 
 // Both Dropdown and Context menu wrappers expose an API-compatible surface
@@ -102,6 +105,9 @@ export function IssueActionsMenuItems({
   onDeletedFallbackPath,
 }: IssueActionsMenuItemsProps) {
   const { t } = useT("issues");
+  const wsId = useWorkspaceId();
+  const statusOptions = useStatusOptions(wsId);
+  const { categoryOf, entryOf } = useIssueStatuses(wsId);
   const {
     isPinned,
     updateField,
@@ -151,15 +157,32 @@ export function IssueActionsMenuItems({
       {/* Status */}
       <P.Sub>
         <P.SubTrigger>
-          <StatusIcon status={issue.status} className="h-3.5 w-3.5" />
+          <StatusIcon
+            status={issue.status}
+            category={categoryOf(issue.status)}
+            color={entryOf(issue.status)?.color}
+            className="h-3.5 w-3.5"
+          />
           {t(($) => $.actions.status)}
         </P.SubTrigger>
         <P.SubContent>
-          {ALL_STATUSES.map((s) => (
-            <P.Item key={s} onClick={() => updateField({ status: s })}>
-              <StatusIcon status={s} className="h-3.5 w-3.5" />
-              {t(($) => $.status[s])}
-              {issue.status === s && (
+          {/* Catalog-driven, like the picker and the filter: every entry point
+              that can change a status must offer the same set, or a custom
+              status is unreachable from the board's right-click menu. One flat
+              list in canonical category order. (MUL-6243) */}
+          {statusOptions.map((option) => (
+            <P.Item
+              key={option.key}
+              onClick={() => updateField({ status: option.key })}
+            >
+              <StatusIcon
+                status={option.key}
+                category={option.category}
+                color={option.color}
+                className="h-3.5 w-3.5"
+              />
+              {option.label}
+              {issue.status === option.key && (
                 <span className="ml-auto text-caption text-muted-foreground">{"✓"}</span>
               )}
             </P.Item>
@@ -312,6 +335,16 @@ export function IssueActionsMenuItems({
           </P.Item>
         </P.SubContent>
       </P.Sub>
+
+      {/* Manual plugin hooks. Rendered by the host rather than by the plugin
+          because the trigger decides identity: a `manual` call acts as the
+          person who picked it, so the entry has to live where the host can
+          prove somebody did. Renders nothing when no plugin declares one. */}
+      <PluginHookMenuItems issueId={issue.id} Item={P.Item} Separator={P.Separator} />
+      {/* Modal surfaces open from here for the same reason: a modal is a third
+          party's UI taking over the screen, so it opens because a person chose
+          it, never on the plugin's own initiative. */}
+      <PluginModalMenuItems issueId={issue.id} Item={P.Item} />
 
       <P.Separator />
 

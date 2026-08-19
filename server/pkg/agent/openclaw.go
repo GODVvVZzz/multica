@@ -61,7 +61,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		return nil, fmt.Errorf("openclaw executable not found at %q: %w", execPath, err)
 	}
 
-	if err := checkOpenclawVersion(ctx, execPath); err != nil {
+	if err := checkOpenclawVersion(ctx, b.cfg.commandAt(execPath)); err != nil {
 		return nil, err
 	}
 
@@ -74,9 +74,9 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	args := buildOpenclawArgs(prompt, sessionID, opts, b.cfg.Logger)
 
-	cmd := exec.CommandContext(runCtx, execPath, args...)
+	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args, trustAgentCommandPositional(0, "agent")))
 	// 500ms, matching cursor-agent — the other backend whose CLI can deliver a
 	// terminal result while keeping a process alive.
 	//
@@ -286,12 +286,12 @@ func customArgsContains(args []string, flag string) bool {
 // minOpenclawVersion. The returned error becomes the task's failure
 // comment, so the message intentionally names the detected version
 // and the upgrade command.
-func checkOpenclawVersion(ctx context.Context, execPath string) error {
-	// Use the same bounded process-tree-aware probe as daemon registration.
-	// This check runs synchronously before Execute creates the provider session,
-	// so a pipe-holding descendant here would otherwise leave a task marked
-	// running without a backend or an inactivity watchdog to stop it.
-	out, err := detectCLIVersion(ctx, execPath)
+func checkOpenclawVersion(ctx context.Context, runtimeCmd Command) error {
+	// The same bounded, process-tree-owning probe daemon registration uses. This
+	// check runs synchronously before Execute creates the provider session, so a
+	// pipe-holding descendant here would otherwise leave a task marked running
+	// with no backend and no inactivity watchdog to stop it.
+	out, err := detectCLIVersion(ctx, runtimeCmd)
 	if err != nil {
 		return fmt.Errorf("openclaw --version failed: %w", err)
 	}

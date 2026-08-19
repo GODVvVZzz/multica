@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
+	"github.com/multica-ai/multica/server/pkg/remotemcp"
 )
 
 // AgentEntry describes a single available agent CLI.
@@ -54,20 +55,37 @@ type ProjectResourceData struct {
 // sharing the canonical JSON shape with the runtime app metadata package.
 type ConnectedAppData = runtimeapps.ConnectedApp
 
+// ActiveSiblingRunData mirrors the claim-time warning context returned by the
+// server for another in-flight issue task owned by this agent. Queued tasks are
+// intentionally excluded from this context.
+type ActiveSiblingRunData struct {
+	TaskID          string `json:"task_id"`
+	IssueID         string `json:"issue_id"`
+	IssueIdentifier string `json:"issue_identifier"`
+	IssueTitle      string `json:"issue_title"`
+	Status          string `json:"status"`
+	CreatedAt       string `json:"created_at"`
+	StartedAt       string `json:"started_at,omitempty"`
+}
+
 // Task represents a claimed task from the server.
 // Agent data (name, skills) is populated by the claim endpoint.
 type Task struct {
-	ID                      string                       `json:"id"`
-	AgentID                 string                       `json:"agent_id"`
-	RuntimeID               string                       `json:"runtime_id"`
-	IssueID                 string                       `json:"issue_id"`
-	WorkspaceID             string                       `json:"workspace_id"`
-	PluginExecutionManifest *PluginExecutionManifestData `json:"plugin_execution_manifest,omitempty"`
+	ID                   string                 `json:"id"`
+	AgentID              string                 `json:"agent_id"`
+	RuntimeID            string                 `json:"runtime_id"`
+	IssueID              string                 `json:"issue_id"`
+	WorkspaceID          string                 `json:"workspace_id"`
+	RemoteMCPConnections []remotemcp.Connection `json:"remote_mcp_connections,omitempty"`
+	// RemoteMCPDaemonToken stays inside the daemon and authenticates the local
+	// broker's credential-resolution calls. It must never enter agent env/config.
+	RemoteMCPDaemonToken string `json:"remote_mcp_daemon_token,omitempty"`
 	// WorkspaceContext mirrors workspace.context (the per-workspace system
 	// prompt set in Settings → General). Server populates this on every claim
 	// regardless of task kind so the daemon can inject `## Workspace Context`
 	// into the brief. Empty when the owner hasn't set one.
 	WorkspaceContext              string                 `json:"workspace_context,omitempty"`
+	ActiveSiblingRuns             []ActiveSiblingRunData `json:"active_sibling_runs,omitempty"`
 	ThreadName                    string                 `json:"thread_name,omitempty"` // semantic title for provider-native session/thread history
 	Agent                         *AgentData             `json:"agent,omitempty"`
 	ConnectedApps                 []ConnectedAppData     `json:"connected_apps,omitempty"` // per-run app capabilities mounted through runtime MCP overlays
@@ -144,20 +162,6 @@ type Task struct {
 	// Empty or non-task-scoped values are fatal for writable agent tasks; the
 	// daemon must not fall back to its own token. See MUL-3292.
 	AuthToken string `json:"auth_token,omitempty"`
-}
-
-// PluginExecutionManifestData mirrors the immutable enqueue-time plugin pin
-// returned by the server. The daemon materializes its skill refs through the
-// normal content-addressed cache; this record is retained on the task for run
-// attribution and diagnostics.
-type PluginExecutionManifestData struct {
-	ID                   string          `json:"id"`
-	SnapshotID           string          `json:"snapshot_id,omitempty"`
-	SnapshotRevision     int64           `json:"snapshot_revision"`
-	SnapshotDigest       string          `json:"snapshot_digest,omitempty"`
-	ComposerVersion      string          `json:"composer_version"`
-	SchemaVersion        int32           `json:"schema_version"`
-	OrderedContributions json.RawMessage `json:"ordered_contributions"`
 }
 
 // ChatAttachmentMeta is the structured attachment metadata the daemon
