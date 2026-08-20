@@ -823,7 +823,15 @@ func openclawTildeRest(path string) (string, bool) {
 // install, so the wrapper drops the user's `$include` and the task boots
 // without their model providers or auth profiles.
 //
-// Both the bare and braced spellings are accepted, and both separators
+// The shape is guaranteed rather than incidental. At `v2026.5.27`,
+// `src/cli/config-cli.ts`'s `runConfigFile` prints `shortenHomePath(...)`, and
+// `src/utils.ts:147-157` uses the `$OPENCLAW_HOME` prefix whenever that variable
+// is non-empty and `~` otherwise — so setting the variable is what selects this
+// form.
+//
+// Only the bare spelling is emitted by that code path. `${OPENCLAW_HOME}` is
+// accepted as defense against a release that spells it the other way, not
+// because anything is known to print it. Both separators are accepted
 // regardless of runtime.GOOS, for the reason openclawTildeRest gives above.
 func openclawHomeRest(path string) (string, bool) {
 	for _, prefix := range []string{"$OPENCLAW_HOME", "${OPENCLAW_HOME}"} {
@@ -838,15 +846,51 @@ func openclawHomeRest(path string) (string, bool) {
 	return "", false
 }
 
+// openclawHomeFromEnv resolves OPENCLAW_HOME to the directory the CLI's printed
+// `$OPENCLAW_HOME` prefix actually stands for.
+//
+// The value itself may be a tilde path. Upstream documents it
+// (`docs/help/environment.md` at `v2026.5.27`: "OPENCLAW_HOME can also be set to
+// a tilde path (e.g. `~/svc`), which gets expanded using the same OS home
+// fallback chain before use") and implements it in `src/infra/home-dir.ts:41-47`.
+// It expands the value *before* computing the home that `config file` then
+// shortens, so on such a host the printed `$OPENCLAW_HOME` stands for
+// `<os-home>/svc`, and landing on the same file means resolving it the same way.
+// Joining the raw value instead leaves the `~` embedded, filepath.Abs turns that
+// into a confident absolute path under the daemon's working directory, and the
+// stat miss reproduces the silent fresh-install failure this whole branch exists
+// to remove.
+//
+// Only the tilde is expanded here, deliberately — not the variable form — so a
+// self-referential value cannot resolve against itself.
+func openclawHomeFromEnv() (string, error) {
+	home := strings.TrimSpace(os.Getenv("OPENCLAW_HOME"))
+	if home == "" {
+		return "", errors.New("environment variable is empty")
+	}
+	rest, isTilde := openclawTildeRest(home)
+	if !isTilde {
+		return home, nil
+	}
+	osHome, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("expand `~` in OPENCLAW_HOME: %w", err)
+	}
+	if rest == "" {
+		return osHome, nil
+	}
+	return filepath.Join(osHome, rest), nil
+}
+
 func expandOpenclawPath(path string) (string, error) {
 	// OPENCLAW_HOME before `~`: the two shapes are mutually exclusive, but the
 	// variable form is checked first because an empty OPENCLAW_HOME has to fail
 	// loudly rather than fall through to a relative-path resolution that would
 	// quietly produce a wrong absolute path.
 	if rest, isOpenclawHome := openclawHomeRest(path); isOpenclawHome {
-		home := strings.TrimSpace(os.Getenv("OPENCLAW_HOME"))
-		if home == "" {
-			return "", fmt.Errorf("expand OPENCLAW_HOME in openclaw config path: environment variable is empty")
+		home, herr := openclawHomeFromEnv()
+		if herr != nil {
+			return "", fmt.Errorf("expand OPENCLAW_HOME in openclaw config path %q: %w", path, herr)
 		}
 		if rest == "" {
 			path = home
@@ -856,7 +900,7 @@ func expandOpenclawPath(path string) (string, error) {
 	} else if rest, isTilde := openclawTildeRest(path); isTilde {
 		home, herr := os.UserHomeDir()
 		if herr != nil {
-			return "", fmt.Errorf("expand `~` in openclaw config path: %w", herr)
+			return "", fmt.Errorf("expand `~` in openclaw config path %q: %w", path, herr)
 		}
 		if rest == "" {
 			path = home

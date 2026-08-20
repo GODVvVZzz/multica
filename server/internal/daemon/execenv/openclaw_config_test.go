@@ -1793,6 +1793,10 @@ func TestExpandOpenclawPathOpenclawHomeUnsetFailsLoudly(t *testing.T) {
 	if !strings.Contains(err.Error(), "OPENCLAW_HOME") {
 		t.Errorf("error %q does not name the variable that could not be expanded", err.Error())
 	}
+	// The path is what the reader of a daemon log needs in order to act.
+	if !strings.Contains(err.Error(), `"$OPENCLAW_HOME/.openclaw/openclaw.json"`) {
+		t.Errorf("error %q does not name the path being expanded", err.Error())
+	}
 }
 
 // TestPrepareOpenclawConfigExpandsOpenclawHome — end-to-end guard, mirroring
@@ -1826,6 +1830,151 @@ func TestPrepareOpenclawConfigExpandsOpenclawHome(t *testing.T) {
 		`$OPENCLAW_HOME\.openclaw\openclaw.json` + "\n"
 	stub := installOpenclawStub(t, map[string]openclawResponse{
 		"config file":                   {stdout: banner},
+		"config get agents.list --json": {stdout: "null"},
+	})
+
+	result, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{OpenclawBin: stub.bin})
+	if err != nil {
+		t.Fatalf("prepareOpenclawConfig: %v", err)
+	}
+	got := mustReadJSON(t, result.ConfigPath)
+	include, ok := got["$include"].([]any)
+	if !ok {
+		t.Fatalf("wrapper has no $include — the user's models and auth profiles would be lost: %#v", got)
+	}
+	if include[0] != wantPath {
+		t.Errorf("$include[0] = %v, want %q", include[0], wantPath)
+	}
+	if result.IncludeRoot != filepath.Dir(wantPath) {
+		t.Errorf("IncludeRoot = %q, want %q", result.IncludeRoot, filepath.Dir(wantPath))
+	}
+}
+
+// TestExpandOpenclawPathOpenclawHomeIsItselfATilde — the variable's *value* may
+// be a tilde path. Upstream documents that and expands it before computing the
+// home `config file` then shortens (`docs/help/environment.md` and
+// `src/infra/home-dir.ts:41-47` at `v2026.5.27`), so the printed
+// `$OPENCLAW_HOME` stands for `<os-home>/svc` and the daemon has to land on the
+// same file. Joining the raw value leaves the `~` embedded, filepath.Abs makes
+// that absolute under the daemon's working directory, and the stat miss is once
+// again reported as a fresh install — the failure this whole branch removes,
+// reached through the branch itself.
+func TestExpandOpenclawPathOpenclawHomeIsItselfATilde(t *testing.T) {
+	osHome := t.TempDir()
+	t.Setenv("HOME", osHome)
+	t.Setenv("USERPROFILE", osHome)
+
+	cases := []struct {
+		name string
+		env  string
+		in   string
+		want string
+	}{
+		{
+			name: "tilde value, posix remainder",
+			env:  "~/svc",
+			in:   `$OPENCLAW_HOME/.openclaw/openclaw.json`,
+			want: filepath.Join(osHome, "svc", ".openclaw", "openclaw.json"),
+		},
+		{
+			name: "tilde value, windows remainder",
+			env:  "~/svc",
+			in:   `$OPENCLAW_HOME\.openclaw\openclaw.json`,
+			want: filepath.Join(osHome, "svc", `.openclaw\openclaw.json`),
+		},
+		{
+			name: "tilde value with windows separator",
+			env:  `~\svc`,
+			in:   `$OPENCLAW_HOME/.openclaw/openclaw.json`,
+			want: filepath.Join(osHome, "svc", ".openclaw", "openclaw.json"),
+		},
+		{
+			name: "bare tilde value",
+			env:  "~",
+			in:   `$OPENCLAW_HOME/.openclaw/openclaw.json`,
+			want: filepath.Join(osHome, ".openclaw", "openclaw.json"),
+		},
+		{
+			name: "bare variable, tilde value",
+			env:  "~/svc",
+			in:   `$OPENCLAW_HOME`,
+			want: filepath.Join(osHome, "svc"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OPENCLAW_HOME", tc.env)
+			got, err := expandOpenclawPath(tc.in)
+			if err != nil {
+				t.Fatalf("expandOpenclawPath(%q) with OPENCLAW_HOME=%q: %v", tc.in, tc.env, err)
+			}
+			if strings.Contains(got, "~") {
+				t.Errorf("expandOpenclawPath(%q) = %q, want the value's `~` expanded (a literal ~ can never stat)", tc.in, got)
+			}
+			if got != tc.want {
+				t.Errorf("expandOpenclawPath(%q) with OPENCLAW_HOME=%q = %q, want %q", tc.in, tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExpandOpenclawPathLeavesLookalikePrefixesAlone — the risk claim is that no
+// path which works today changes, and this is what guards it. A variable whose
+// name merely starts with OPENCLAW_HOME must not be treated as the shape.
+func TestExpandOpenclawPathLeavesLookalikePrefixesAlone(t *testing.T) {
+	t.Setenv("OPENCLAW_HOME", t.TempDir())
+
+	for _, in := range []string{
+		`$OPENCLAW_HOMEX/y`,
+		`$OPENCLAW_HOME_EXTRA/y`,
+		`${OPENCLAW_HOMEX}/y`,
+		`$OPENCLAW/y`,
+	} {
+		t.Run(in, func(t *testing.T) {
+			got, err := expandOpenclawPath(in)
+			if err != nil {
+				t.Fatalf("expandOpenclawPath(%q): %v", in, err)
+			}
+			// Untouched by the new branch: still resolved as an ordinary
+			// relative path, exactly as on `main`.
+			want, aerr := filepath.Abs(in)
+			if aerr != nil {
+				t.Fatalf("filepath.Abs(%q): %v", in, aerr)
+			}
+			if got != want {
+				t.Errorf("expandOpenclawPath(%q) = %q, want it left as a relative path -> %q", in, got, want)
+			}
+		})
+	}
+}
+
+// TestPrepareOpenclawConfigExpandsTildeValuedOpenclawHome — the same defect at
+// the level that decides what the user actually gets. A unit assertion on
+// expandOpenclawPath would not have caught it: the value's `~` survived into a
+// path that looks absolute, so only following it through to the wrapper shows
+// the `$include` going missing.
+func TestPrepareOpenclawConfigExpandsTildeValuedOpenclawHome(t *testing.T) {
+	envRoot := t.TempDir()
+	workDir := filepath.Join(envRoot, "workdir")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workdir: %v", err)
+	}
+
+	osHome := t.TempDir()
+	t.Setenv("HOME", osHome)
+	t.Setenv("USERPROFILE", osHome)
+	t.Setenv("OPENCLAW_HOME", "~/svc")
+
+	wantPath := filepath.Join(osHome, "svc", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(wantPath), 0o755); err != nil {
+		t.Fatalf("mkdir user cfg dir: %v", err)
+	}
+	if err := os.WriteFile(wantPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("write user cfg: %v", err)
+	}
+
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file":                   {stdout: `$OPENCLAW_HOME/.openclaw/openclaw.json` + "\n"},
 		"config get agents.list --json": {stdout: "null"},
 	})
 
