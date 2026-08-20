@@ -21,12 +21,17 @@ import (
 // the rest of the task env.
 const openclawConfigFile = "openclaw-config.json"
 
-// openclawUserSnapshotFile is the sanitized copy of the user's fully
-// resolved openclaw config the wrapper $includes when the agent has a
-// managed mcp_config. It is the user's config minus the `mcp` block so the
-// wrapper's managed `mcp.servers` is the only MCP definition visible to
-// OpenClaw — true strict-replace, not deep-merge-by-name. Lives in envRoot
-// at 0o600 next to the wrapper.
+// openclawUserSnapshotFile is what the wrapper $includes when the agent has a
+// managed mcp_config. Despite the name it holds no copy of the user's config:
+// it is an include chain — the user's live config, then openclawMcpResetFile,
+// then the resolved non-server `mcp` settings — so the wrapper's managed
+// `mcp.servers` is the only MCP server definition visible to OpenClaw. True
+// strict-replace, not deep-merge-by-name.
+//
+// It replaced a flat sanitized copy of the resolved config, which is why the
+// file is still named "snapshot". Lives in envRoot at 0o600 next to the
+// wrapper; the 0o600 is now about the include paths it names rather than about
+// secrets it carries, because it carries none.
 const openclawUserSnapshotFile = "openclaw-user-snapshot.json"
 
 // openclawMcpResetFile contributes `{"mcp":null}` between the user's config and
