@@ -6140,6 +6140,171 @@ func skillRefFromBundle(bundle SkillData) SkillRefData {
 	}
 }
 
+// taskModelSelection is what a task actually launches with: the model
+// selector plus the capability overrides that survived validation.
+type taskModelSelection struct {
+	Model         string
+	ThinkingLevel string
+	ServiceTier   string
+}
+
+// resolveTaskModelSelection settles the model selector and its capability
+// overrides against the runtime's own model catalog, reading that catalog at
+// most once per task — and not at all when nothing needs it.
+//
+// The single read is the point. Discovery is a CLI subprocess with a 15-30s
+// ceiling, and cachedDiscovery deliberately does not memoize a result that
+// came back empty or as a fallback (#3729, MUL-5549) so a transient failure
+// can retry immediately. A logged-out or timing-out runtime therefore pays
+// that ceiling in full on every read, and a task that read the catalog once to
+// qualify its model and again to validate thinking_level would pay it twice
+// before the agent even starts (MUL-6471 review).
+//
+// Who asks for the catalog:
+//   - opencode and its DevEco fork cannot execute an unqualified selector, so
+//     a pinned model has to be resolved against the catalog before launch.
+//   - thinking_level / service_tier are catalog-owned and keyed on the
+//     catalog's own model id, so they need it whenever they are set.
+//
+// A pi task with no capability override asks for neither: pi's own resolver
+// accepts the persisted id in every shape it can take, so the daemon has
+// nothing to add and skips discovery entirely. Same for claude, codex, and any
+// task that pins no model.
+//
+// Qualification runs first because both checks below match on the catalog's
+// canonical id: an unqualified id silently fails every lookup and drops a
+// perfectly valid level (GH #7300).
+func resolveTaskModelSelection(
+	ctx context.Context,
+	provider string,
+	runtimeCmd agent.Command,
+	sel taskModelSelection,
+	taskLog *slog.Logger,
+) taskModelSelection {
+	capabilityChecksPending := sel.ThinkingLevel != "" || sel.ServiceTier != ""
+
+	read := false
+	var (
+		catalog    agent.Catalog
+		catalogErr error
+	)
+	loadCatalog := func() (agent.Catalog, error) {
+		if !read {
+			read = true
+			catalog, catalogErr = listModels(ctx, provider, runtimeCmd)
+		}
+		return catalog, catalogErr
+	}
+
+	sel.Model = qualifyTaskModel(provider, sel.Model, capabilityChecksPending, loadCatalog, taskLog)
+
+	// service_tier is catalog-owned and currently Codex-only. As with
+	// thinking_level, stale or incompatible persisted values degrade to the
+	// runtime default instead of failing the task. Catalog lookup errors pass
+	// through so a transient discovery failure does not silently disable a
+	// previously valid user choice.
+	if sel.ServiceTier != "" {
+		ok, err := agent.ValidateServiceTierWith(loadCatalog, provider, sel.Model, sel.ServiceTier)
+		if err != nil {
+			taskLog.Warn("service_tier: catalog lookup failed; passing through",
+				"provider", provider,
+				"model", sel.Model,
+				"service_tier", sel.ServiceTier,
+				"error", err,
+			)
+		} else if !ok {
+			taskLog.Warn("service_tier: not valid for this (provider, model); skipping injection",
+				"provider", provider,
+				"model", sel.Model,
+				"service_tier", sel.ServiceTier,
+			)
+			sel.ServiceTier = ""
+		}
+	}
+	// Per-model guard: the server validates the literal token against the
+	// provider's enum, but per-model gaps (Claude's `xhigh` on a non-Opus
+	// model, Codex's per-model `supported_reasoning_levels`) only resolve
+	// here, against the daemon's local CLI catalog. Invalid combinations
+	// log a warning and drop the level rather than failing the task, so a
+	// stale persisted value never blocks execution. An empty model is
+	// resolved by ValidateThinkingLevelWith to the provider's default model so
+	// default-model tasks aren't misjudged — except for codex, whose empty
+	// model follows config.toml (any model) and so fails closed, dropping the
+	// level here without a catalog read at all. Discovery errors fail open for
+	// resolved models: if we can't list models, we keep the persisted level
+	// and let the CLI object.
+	if sel.ThinkingLevel != "" {
+		ok, err := agent.ValidateThinkingLevelWith(loadCatalog, provider, sel.Model, sel.ThinkingLevel)
+		if err != nil {
+			taskLog.Warn("thinking_level: catalog lookup failed; passing through",
+				"provider", provider,
+				"model", sel.Model,
+				"thinking_level", sel.ThinkingLevel,
+				"error", err,
+			)
+		} else if !ok {
+			taskLog.Warn("thinking_level: not valid for this (provider, model); skipping injection",
+				"provider", provider,
+				"model", sel.Model,
+				"thinking_level", sel.ThinkingLevel,
+			)
+			sel.ThinkingLevel = ""
+		}
+	}
+
+	return sel
+}
+
+// qualifyTaskModel promotes a persisted model id to the canonical
+// `<provider>/<id>` selector its runtime catalog advertises, and returns the
+// model to actually launch with.
+//
+// agent.model holds whatever was persisted, and for gateway-style providers a
+// bare model id is itself slash-shaped (`claude/claude-opus-5` under provider
+// `multica-anthropic`), so the delimiter cannot tell a missing provider from a
+// present one — only the catalog knows (GH #7300).
+//
+// It reads the catalog for two distinct reasons, and neither is "because we
+// can": either the runtime refuses to launch without a qualified selector, or
+// a capability check is about to read the catalog anyway and will match
+// nothing unless the id is canonical first. When neither holds, the persisted
+// value goes to the CLI untouched and no subprocess is spawned.
+func qualifyTaskModel(
+	provider, model string,
+	capabilityChecksPending bool,
+	loadCatalog func() (agent.Catalog, error),
+	taskLog *slog.Logger,
+) string {
+	if model == "" {
+		return model
+	}
+	if !agent.ModelSelectorMustBeProviderQualified(provider) && !capabilityChecksPending {
+		return model
+	}
+	catalog, err := loadCatalog()
+	if err != nil {
+		// Same fail-open posture as the capability checks: an unreachable
+		// catalog must not stop a task whose model may well be exactly what
+		// the CLI expects.
+		taskLog.Warn("model: catalog lookup failed; using the configured model as-is",
+			"provider", provider,
+			"model", model,
+			"error", err,
+		)
+		return model
+	}
+	qualified, rewritten := agent.QualifyModelID(catalog, model)
+	if !rewritten {
+		return model
+	}
+	taskLog.Info("model: qualified against the runtime catalog",
+		"provider", provider,
+		"configured_model", model,
+		"model", qualified,
+	)
+	return qualified
+}
+
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot int, taskLog *slog.Logger) (taskResult TaskResult, returnErr error) {
 	// A claim carries the task-row agent id both at the top level and inside
 	// the expanded agent configuration. The top-level id is authoritative
@@ -6973,10 +7138,32 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		return TaskResult{}, fmt.Errorf("create agent backend: %w", err)
 	}
 
+	// Two-tier model resolution: an explicit agent.model wins,
+	// then the daemon-wide MULTICA_<PROVIDER>_MODEL env var. If
+	// both are empty we deliberately pass "" through — each
+	// backend omits `--model` from the CLI invocation, so the
+	// provider picks its own default (Claude Code's shipped
+	// default, codex app-server's account-scoped default, etc.).
+	// Baking a Go-side "recommended default" here is how the
+	// cursor regression happened — static guesses drift from
+	// whatever the upstream CLI actually accepts.
+	//
+	// Resolved before the start log rather than at first use: logging
+	// entry.Model there reported the env-var tier alone, so every task whose
+	// model came from agent.model — the common case — announced itself with an
+	// empty model and looked like the selection had been dropped (GH #7300).
+	model := ""
+	if task.Agent != nil && task.Agent.Model != "" {
+		model = task.Agent.Model
+	}
+	if model == "" {
+		model = entry.Model
+	}
+
 	taskLog.Info("starting agent",
 		"provider", provider,
 		"workdir", env.WorkDir,
-		"model", entry.Model,
+		"model", model,
 		"reused", reused,
 	)
 	if task.PriorSessionID != "" {
@@ -7002,80 +7189,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// has no overlay to protect and keeps its flags untouched.
 		customArgs = hermesOverlayCustomArgs
 	}
-	// Two-tier model resolution: an explicit agent.model wins,
-	// then the daemon-wide MULTICA_<PROVIDER>_MODEL env var. If
-	// both are empty we deliberately pass "" through — each
-	// backend omits `--model` from the CLI invocation, so the
-	// provider picks its own default (Claude Code's shipped
-	// default, codex app-server's account-scoped default, etc.).
-	// Baking a Go-side "recommended default" here is how the
-	// cursor regression happened — static guesses drift from
-	// whatever the upstream CLI actually accepts.
-	model := ""
-	if task.Agent != nil && task.Agent.Model != "" {
-		model = task.Agent.Model
-	}
-	if model == "" {
-		model = entry.Model
-	}
 	thinkingLevel := ""
 	serviceTier := ""
 	if task.Agent != nil {
 		thinkingLevel = task.Agent.ThinkingLevel
 		serviceTier = task.Agent.ServiceTier
 	}
-	// service_tier is catalog-owned and currently Codex-only. As with
-	// thinking_level, stale or incompatible persisted values degrade to the
-	// runtime default instead of failing the task. Catalog lookup errors pass
-	// through so a transient discovery failure does not silently disable a
-	// previously valid user choice.
-	if serviceTier != "" {
-		ok, err := agent.ValidateServiceTier(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs), model, serviceTier)
-		if err != nil {
-			taskLog.Warn("service_tier: catalog lookup failed; passing through",
-				"provider", provider,
-				"model", model,
-				"service_tier", serviceTier,
-				"error", err,
-			)
-		} else if !ok {
-			taskLog.Warn("service_tier: not valid for this (provider, model); skipping injection",
-				"provider", provider,
-				"model", model,
-				"service_tier", serviceTier,
-			)
-			serviceTier = ""
-		}
-	}
-	// Per-model guard: the server validates the literal token against the
-	// provider's enum, but per-model gaps (Claude's `xhigh` on a non-Opus
-	// model, Codex's per-model `supported_reasoning_levels`) only resolve
-	// here, against the daemon's local CLI catalog. Invalid combinations
-	// log a warning and drop the level rather than failing the task, so a
-	// stale persisted value never blocks execution. An empty model is
-	// resolved by ValidateThinkingLevel to the provider's default model so
-	// default-model tasks aren't misjudged — except for codex, whose empty
-	// model follows config.toml (any model) and so fails closed, dropping the
-	// level here. Discovery errors fail open for resolved models: if we can't
-	// list models, we keep the persisted level and let the CLI object.
-	if thinkingLevel != "" {
-		ok, err := agent.ValidateThinkingLevel(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs), model, thinkingLevel)
-		if err != nil {
-			taskLog.Warn("thinking_level: catalog lookup failed; passing through",
-				"provider", provider,
-				"model", model,
-				"thinking_level", thinkingLevel,
-				"error", err,
-			)
-		} else if !ok {
-			taskLog.Warn("thinking_level: not valid for this (provider, model); skipping injection",
-				"provider", provider,
-				"model", model,
-				"thinking_level", thinkingLevel,
-			)
-			thinkingLevel = ""
-		}
-	}
+	selection := resolveTaskModelSelection(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs),
+		taskModelSelection{Model: model, ThinkingLevel: thinkingLevel, ServiceTier: serviceTier}, taskLog)
+	model, thinkingLevel, serviceTier = selection.Model, selection.ThinkingLevel, selection.ServiceTier
+
 	var idleWatchdogTimeout time.Duration
 	if provider == "opencode" {
 		idleWatchdogTimeout = d.cfg.OpenCodeIdleWatchdog

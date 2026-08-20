@@ -33,8 +33,7 @@ import (
 const LocalSourcePrefix = "local:"
 
 // PluginService owns plugin installation, configuration, and plugin-owned
-// state. It never executes plugin code: a plugin runs only in the user's
-// browser inside a sandboxed iframe, or on the author's own server.
+// state.
 type PluginService struct {
 	Queries   *db.Queries
 	TxStarter TxStarter

@@ -9,7 +9,7 @@ The source of truth for code naming, i18n glossary, and Chinese product voice is
 - `apps/docs/content/docs/developers/conventions.mdx`
 - `apps/docs/content/docs/developers/conventions.zh.mdx`
 
-Read it before editing translations in `packages/views/locales/`, naming routes/packages/files/DB columns/types, or writing Chinese UI/docs copy. Do not rely on `packages/views/locales/glossary.md`; it is only a redirect stub.
+Read it before editing translations in `packages/views/locales/`, naming routes/packages/files/DB columns/types, or writing Chinese UI/docs copy.
 
 ## Project Shape
 

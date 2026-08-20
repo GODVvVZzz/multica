@@ -4924,6 +4924,14 @@ func (h *Handler) BatchIssueGCCheck(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// ONE resolver for the whole batch, not a point lookup per row. The
+	// package-level Effective issues a GetIssueStatusEntryByKey for every custom
+	// key it sees, so resolving inside this loop cost up to maxIssueGCBatchSize
+	// catalog queries per request — on an endpoint whose entire purpose is to
+	// replace per-issue requests, and which every installed daemon runs on a
+	// timer. The resolver reads the catalog lazily and at most once, so an
+	// all-built-in batch still costs zero. (MUL-6243)
+	resolver := issuestatus.NewResolver(workspaceUUID)
 	items := make([]batchIssueGCCheckItem, 0, len(req.IssueIDs))
 	for i, issueID := range req.IssueIDs {
 		row, found := rows[canonicalIDs[i]]
@@ -4934,7 +4942,7 @@ func (h *Handler) BatchIssueGCCheck(w http.ResponseWriter, r *http.Request) {
 			// database of its own, so the canonical status is resolved here.
 			// Normalizing server-side also means daemons that predate custom
 			// statuses keep making correct GC decisions. (MUL-6243)
-			item.Status = issuestatus.Effective(r.Context(), h.Queries, workspaceUUID, row.Status)
+			item.Status = resolver.Effective(r.Context(), h.issueStatusCatalog(), row.Status)
 			updatedAt := row.UpdatedAt.Time
 			item.UpdatedAt = &updatedAt
 		}
@@ -4963,7 +4971,7 @@ func (h *Handler) GetIssueGCCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		// Same reasoning as BatchIssueGCCheck: normalize server-side so the
 		// daemon's terminal-status test stays correct. (MUL-6243)
-		"status":     issuestatus.Effective(r.Context(), h.Queries, issue.WorkspaceID, issue.Status),
+		"status":     issuestatus.Effective(r.Context(), h.issueStatusCatalog(), issue.WorkspaceID, issue.Status),
 		"updated_at": issue.UpdatedAt.Time,
 	})
 }
