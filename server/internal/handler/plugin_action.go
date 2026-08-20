@@ -12,6 +12,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/dbid"
 	"github.com/multica-ai/multica/server/pkg/plugincontract"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -461,6 +462,7 @@ func (h *Handler) CreatePluginComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	createdComment, err := h.Queries.CreateComment(r.Context(), db.CreateCommentParams{
+		ID:          dbid.NewV7(),
 		IssueID:     issue.ID,
 		WorkspaceID: caller.WorkspaceID,
 		AuthorType:  authorType,
