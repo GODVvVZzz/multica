@@ -814,8 +814,46 @@ func openclawTildeRest(path string) (string, bool) {
 	return "", false
 }
 
+// openclawHomeRest recognizes the symbolic shape current OpenClaw releases
+// print when OPENCLAW_HOME is set: the variable name rather than its value, for
+// example `$OPENCLAW_HOME\.openclaw\openclaw.json`. Nothing downstream expands
+// it, so the line reaches filepath.Abs as an ordinary relative path and lands
+// under the daemon's working directory — the same stat miss #6630 fixed for the
+// tilde form, with the same consequence: indistinguishable from a fresh
+// install, so the wrapper drops the user's `$include` and the task boots
+// without their model providers or auth profiles.
+//
+// Both the bare and braced spellings are accepted, and both separators
+// regardless of runtime.GOOS, for the reason openclawTildeRest gives above.
+func openclawHomeRest(path string) (string, bool) {
+	for _, prefix := range []string{"$OPENCLAW_HOME", "${OPENCLAW_HOME}"} {
+		if path == prefix {
+			return "", true
+		}
+		if len(path) > len(prefix) && strings.HasPrefix(path, prefix) &&
+			(path[len(prefix)] == '/' || path[len(prefix)] == '\\') {
+			return path[len(prefix)+1:], true
+		}
+	}
+	return "", false
+}
+
 func expandOpenclawPath(path string) (string, error) {
-	if rest, isTilde := openclawTildeRest(path); isTilde {
+	// OPENCLAW_HOME before `~`: the two shapes are mutually exclusive, but the
+	// variable form is checked first because an empty OPENCLAW_HOME has to fail
+	// loudly rather than fall through to a relative-path resolution that would
+	// quietly produce a wrong absolute path.
+	if rest, isOpenclawHome := openclawHomeRest(path); isOpenclawHome {
+		home := strings.TrimSpace(os.Getenv("OPENCLAW_HOME"))
+		if home == "" {
+			return "", fmt.Errorf("expand OPENCLAW_HOME in openclaw config path: environment variable is empty")
+		}
+		if rest == "" {
+			path = home
+		} else {
+			path = filepath.Join(home, rest)
+		}
+	} else if rest, isTilde := openclawTildeRest(path); isTilde {
 		home, herr := os.UserHomeDir()
 		if herr != nil {
 			return "", fmt.Errorf("expand `~` in openclaw config path: %w", herr)

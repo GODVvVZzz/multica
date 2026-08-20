@@ -1746,6 +1746,106 @@ func TestExpandOpenclawPathTildeSeparators(t *testing.T) {
 	}
 }
 
+// TestExpandOpenclawPathOpenclawHome — the same failure as #6630 in a second
+// shape. When OPENCLAW_HOME is set, current releases print the variable name
+// instead of its value, and an unexpanded `$OPENCLAW_HOME\...` line is not
+// absolute, so it lands under the daemon's working directory and stats as
+// missing — reported as a fresh install, wrapper without the user's $include.
+func TestExpandOpenclawPathOpenclawHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("OPENCLAW_HOME", home)
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "dollar Windows separator", in: `$OPENCLAW_HOME\.openclaw\openclaw.json`, want: filepath.Join(home, `.openclaw\openclaw.json`)},
+		{name: "braced POSIX separator", in: `${OPENCLAW_HOME}/.openclaw/openclaw.json`, want: filepath.Join(home, ".openclaw", "openclaw.json")},
+		{name: "bare variable", in: `$OPENCLAW_HOME`, want: home},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := expandOpenclawPath(tc.in)
+			if err != nil {
+				t.Fatalf("expandOpenclawPath(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("expandOpenclawPath(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExpandOpenclawPathOpenclawHomeUnsetFailsLoudly — the variable form with
+// nothing to expand it to must be an error, not a relative-path fallback.
+// Falling through would resolve the literal `$OPENCLAW_HOME` segment against
+// the daemon's working directory and hand back a confident absolute path to a
+// file that cannot exist, which is exactly the silent-fresh-install failure
+// this shape causes in the first place.
+func TestExpandOpenclawPathOpenclawHomeUnsetFailsLoudly(t *testing.T) {
+	t.Setenv("OPENCLAW_HOME", "")
+
+	got, err := expandOpenclawPath(`$OPENCLAW_HOME/.openclaw/openclaw.json`)
+	if err == nil {
+		t.Fatalf("expandOpenclawPath returned %q, want an error when OPENCLAW_HOME is empty", got)
+	}
+	if !strings.Contains(err.Error(), "OPENCLAW_HOME") {
+		t.Errorf("error %q does not name the variable that could not be expanded", err.Error())
+	}
+}
+
+// TestPrepareOpenclawConfigExpandsOpenclawHome — end-to-end guard, mirroring
+// TestPrepareOpenclawConfigExpandsWindowsTilde below: the banner-then-path
+// output shape with the variable form must still produce a wrapper that
+// $includes the user's config, and the include-root grant that goes with it.
+func TestPrepareOpenclawConfigExpandsOpenclawHome(t *testing.T) {
+	envRoot := t.TempDir()
+	workDir := filepath.Join(envRoot, "workdir")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workdir: %v", err)
+	}
+
+	openclawHome := t.TempDir()
+	t.Setenv("OPENCLAW_HOME", openclawHome)
+
+	// Built with filepath.Join for the reason the tilde test gives: the
+	// remainder arrives with the CLI's separators and production normalizes it
+	// the same way, so on a non-Windows host this is one oddly-named file.
+	wantPath := filepath.Join(openclawHome, `.openclaw\openclaw.json`)
+	if err := os.MkdirAll(filepath.Dir(wantPath), 0o755); err != nil {
+		t.Fatalf("mkdir user cfg dir: %v", err)
+	}
+	if err := os.WriteFile(wantPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("write user cfg: %v", err)
+	}
+
+	banner := "|\no  Config warnings ---------------------------------+\n" +
+		"|  - plugins.entries.duckduckgo: plugin not found  |\n" +
+		"+--------------------------------------------------+\n" +
+		`$OPENCLAW_HOME\.openclaw\openclaw.json` + "\n"
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file":                   {stdout: banner},
+		"config get agents.list --json": {stdout: "null"},
+	})
+
+	result, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{OpenclawBin: stub.bin})
+	if err != nil {
+		t.Fatalf("prepareOpenclawConfig: %v", err)
+	}
+	got := mustReadJSON(t, result.ConfigPath)
+	include, ok := got["$include"].([]any)
+	if !ok {
+		t.Fatalf("wrapper has no $include — the user's models and auth profiles would be lost: %#v", got)
+	}
+	if include[0] != wantPath {
+		t.Errorf("$include[0] = %v, want %q", include[0], wantPath)
+	}
+	if result.IncludeRoot != filepath.Dir(wantPath) {
+		t.Errorf("IncludeRoot = %q, want %q", result.IncludeRoot, filepath.Dir(wantPath))
+	}
+}
+
 // TestPrepareOpenclawConfigExpandsWindowsTilde — end-to-end guard for #6630:
 // the reporter's exact `openclaw config file` output (a config-warning banner
 // followed by a Windows-shortened path) must still produce a wrapper that
