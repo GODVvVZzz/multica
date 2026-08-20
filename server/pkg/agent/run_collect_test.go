@@ -76,6 +76,20 @@ func TestCheckOpenclawVersionReapsPipeHoldingGrandchild(t *testing.T) {
 	}
 }
 
+// TestCheckOpenclawVersionAcceptsStderrOnlyVersion — the gate replaced
+// cmd.CombinedOutput(), so stderr has to stay in the parse. A build that prints
+// its banner there would otherwise fail the minimum-version check with an empty
+// output, which skips the runtime entirely.
+func TestCheckOpenclawVersionAcceptsStderrOnlyVersion(t *testing.T) {
+	cli := writeCLI(t, "#!/bin/sh\necho 'OpenClaw 2026.7.1' >&2\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := checkOpenclawVersion(ctx, Command{Path: cli}); err != nil {
+		t.Fatalf("checkOpenclawVersion with the version on stderr: %v", err)
+	}
+}
+
 // waitForPidFile waits for the forked helper to record its pid.
 func waitForPidFile(t *testing.T, pidFile string) int {
 	t.Helper()
@@ -95,6 +109,20 @@ func waitForPidFile(t *testing.T, pidFile string) int {
 // processAlive reports whether pid still exists. Signal 0 only performs the
 // permission/existence check.
 func processAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
+
+// waitForFile polls until path exists, so a test can synchronize on something
+// the fake CLI did rather than on how long it took to get there.
+func waitForFile(t *testing.T, path string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("fake CLI never created %s within %v", path, within)
+}
 
 // waitForProcessGone polls until pid is gone, since SIGKILL delivery and
 // reaping are asynchronous.
@@ -201,6 +229,29 @@ func TestRunCollectRespectsProcessGroupPrecondition(t *testing.T) {
 	}
 }
 
+// TestRunCollectCmdHonorsContextWithoutACommandContext — RunCollectCmd takes a
+// command the caller built, so "the ctx is enforced" must not quietly depend on
+// that caller having used exec.CommandContext. A plain exec.Command with a
+// hanging CLI is the shape that would otherwise block for as long as the CLI
+// felt like running, with the ctx argument doing nothing at all.
+func TestRunCollectCmdHonorsContextWithoutACommandContext(t *testing.T) {
+	cli := writeCLI(t, "#!/bin/sh\nsleep 300\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, _, err := RunCollectCmd(ctx, exec.Command(cli), nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Error("expected an error once the context expired")
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("took %v — the context did not bound a command built without one", elapsed)
+	}
+}
+
 // TestDetectCLIVersionReapsForkedHelper covers the real caller: version
 // detection runs inside the daemon's blocking preflight for every registered
 // provider, and it was one of the paths leaking `openclaw-config`.
@@ -248,6 +299,10 @@ func assertNoGoroutineGrowth(t *testing.T, before int) {
 // goroutine on a CLI whose descendant holds the pipe. Previously the wait
 // goroutine could sit in cmd.Wait indefinitely when no owned process-tree
 // boundary released the inherited pipe.
+//
+// Scope: this proves convergence for a tree the kill reaches, which is the case
+// the fix is about. It does not — and cannot — prove anything about a process
+// the OS refuses to terminate; finish() reports that case instead of hiding it.
 func TestRunCollectLeavesNoGoroutines(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "helper.pid")
 	cli := writeForkingCLI(t, pidFile)
@@ -268,7 +323,8 @@ func TestRunCollectLeavesNoGoroutines(t *testing.T) {
 
 // TestRunCollectQuietLeavesNoGoroutines pins the same contract on the path that
 // returns while the CLI is still alive — the one that has to kill the child
-// itself rather than waiting for it.
+// itself rather than waiting for it. Same scope caveat as above: a successful
+// reap is what is being verified.
 func TestRunCollectQuietLeavesNoGoroutines(t *testing.T) {
 	cli := writePrintThenHangCLI(t, quietTestJSON, "")
 

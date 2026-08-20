@@ -287,13 +287,36 @@ func customArgsContains(args []string, flag string) bool {
 // comment, so the message intentionally names the detected version
 // and the upgrade command.
 func checkOpenclawVersion(ctx context.Context, runtimeCmd Command) error {
-	// The same bounded, process-tree-owning probe daemon registration uses. This
-	// check runs synchronously before Execute creates the provider session, so a
+	// This runs synchronously before Execute creates the provider session, so a
 	// pipe-holding descendant here would otherwise leave a task marked running
-	// with no backend and no inactivity watchdog to stop it.
-	out, err := detectCLIVersion(ctx, runtimeCmd)
+	// with no backend and no inactivity watchdog to stop it. ctx is the task's
+	// and can be hours long, so the probe carries the same bound every other
+	// provider's version probe gets.
+	ctx, cancel := context.WithTimeout(ctx, detectVersionTimeout)
+	defer cancel()
+
+	// RunCollectCmd for the reason recorded on openclawCLITimeout: it owns the
+	// pipes, so Wait returns on the direct child's exit whatever a descendant is
+	// holding, and it reaps the tree instead of orphaning it.
+	//
+	// Both streams are parsed, and extractVersionLine is deliberately bypassed.
+	// This replaced cmd.CombinedOutput(), and dropping stderr would fail the
+	// gate outright on a build that prints its version there. parseOpenclawVersion
+	// already scans the whole text with openclaw's own version pattern, whereas
+	// picking "the first line containing a semver" first would let unrelated
+	// stderr noise answer for it — a node deprecation warning carries one.
+	// stdout is offered first so it wins when both streams match.
+	cmd := runtimeCmd.exec(ctx, "--version")
+	stdout, stderr, err := RunCollectCmd(ctx, cmd, nil)
 	if err != nil {
-		return fmt.Errorf("openclaw --version failed: %w", err)
+		// ExplainExecError by hand: detectCLIVersion applies it on the daemon's
+		// probe path, and this is the other gate that has to name an ENOEXEC
+		// shim rather than report an opaque exec failure (MUL-6164).
+		return fmt.Errorf("openclaw --version failed: %w", ExplainExecError(err))
+	}
+	out := string(stdout)
+	if trimmed := strings.TrimSpace(stderr); trimmed != "" {
+		out += "\n" + trimmed
 	}
 	detected, ok := parseOpenclawVersion(out)
 	if !ok {

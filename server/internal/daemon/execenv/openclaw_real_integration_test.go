@@ -4,12 +4,10 @@ package execenv
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -35,95 +33,6 @@ func realOpenclawBin(t *testing.T) string {
 		}
 	}
 	return bin
-}
-
-func realOpenclawConfig(t *testing.T) (bin, activeConfig string) {
-	t.Helper()
-	bin = realOpenclawBin(t)
-
-	home := t.TempDir()
-	stateDir := filepath.Join(home, ".openclaw")
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		t.Fatalf("create isolated OpenClaw state: %v", err)
-	}
-	activeConfig = filepath.Join(stateDir, "openclaw.json")
-	config := `{
-		"gateway": {"mode": "local"},
-		"mcp": {
-			"sessionIdleTtlMs": 300000,
-			"servers": {"user-only": {"command": "echo"}}
-		}
-	}`
-	if err := os.WriteFile(activeConfig, []byte(config), 0o600); err != nil {
-		t.Fatalf("write isolated OpenClaw config: %v", err)
-	}
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	t.Setenv("OPENCLAW_HOME", home)
-	t.Setenv("OPENCLAW_STATE_DIR", stateDir)
-	t.Setenv("OPENCLAW_CONFIG_PATH", activeConfig)
-	return bin, activeConfig
-}
-
-func TestPrepareOpenclawConfigRealCLI(t *testing.T) {
-	bin, activeConfig := realOpenclawConfig(t)
-
-	envRoot := t.TempDir()
-	workDir := filepath.Join(envRoot, "workdir")
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		t.Fatalf("create workdir: %v", err)
-	}
-
-	started := time.Now()
-	result, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{
-		OpenclawBin: bin,
-		McpConfig:   json.RawMessage(`{"mcpServers":{}}`),
-	})
-	if err != nil {
-		t.Fatalf("prepare with real OpenClaw CLI: %v", err)
-	}
-	t.Logf("real OpenClaw config preparation completed in %s", time.Since(started))
-
-	data, err := os.ReadFile(result.ConfigPath)
-	if err != nil {
-		t.Fatalf("read generated wrapper: %v", err)
-	}
-	var wrapper map[string]any
-	if err := json.Unmarshal(data, &wrapper); err != nil {
-		t.Fatalf("parse generated wrapper: %v", err)
-	}
-	include, ok := wrapper["$include"].([]any)
-	snapshotPath := filepath.Join(envRoot, openclawUserSnapshotFile)
-	if !ok || len(include) != 1 || include[0] != snapshotPath {
-		t.Fatalf("wrapper $include = %#v, want [%q]", wrapper["$include"], snapshotPath)
-	}
-	agents, ok := wrapper["agents"].(map[string]any)
-	if !ok {
-		t.Fatalf("wrapper agents = %#v, want object", wrapper["agents"])
-	}
-	defaults, ok := agents["defaults"].(map[string]any)
-	if !ok || defaults["workspace"] != workDir {
-		t.Fatalf("wrapper agents.defaults = %#v, want workspace %q", agents["defaults"], workDir)
-	}
-	if result.IncludeRoot != filepath.Dir(activeConfig) {
-		t.Fatalf("include root = %q, want %q", result.IncludeRoot, filepath.Dir(activeConfig))
-	}
-
-	// Ask the real CLI to resolve the generated include chain. This verifies
-	// the reset bridge rather than merely inspecting the JSON files we wrote.
-	t.Setenv("OPENCLAW_CONFIG_PATH", result.ConfigPath)
-	t.Setenv("OPENCLAW_INCLUDE_ROOTS", result.IncludeRoot)
-	resolvedMcp, err := openclawResolvedMcpConfig(bin, openclawCLITimeout)
-	if err != nil {
-		t.Fatalf("resolve generated wrapper with real OpenClaw CLI: %v", err)
-	}
-	servers, ok := resolvedMcp["servers"].(map[string]any)
-	if !ok || len(servers) != 0 {
-		t.Fatalf("resolved managed servers = %#v, want empty and no user-only leak", resolvedMcp["servers"])
-	}
-	if resolvedMcp["sessionIdleTtlMs"] != float64(300000) {
-		t.Fatalf("resolved non-server MCP settings = %#v, want sessionIdleTtlMs preserved", resolvedMcp)
-	}
 }
 
 func TestOpenclawDaemonEquivalentRealTask(t *testing.T) {

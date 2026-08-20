@@ -184,21 +184,58 @@ func TestRunCollectQuietReportsLateNonZeroExit(t *testing.T) {
 // TestRunCollectQuietWithoutCompletenessRuleWaitsForExit pins the conservative
 // default: with no rule there is nothing to judge the output by, so the early
 // return is disabled entirely rather than guessed at.
+//
+// Synchronized on a marker the CLI writes after its answer rather than on a
+// deadline. The two assertions want opposite budgets — "returned an error" wants
+// a short one, "the captured bytes survived" wants the spawn to have finished —
+// and any single number that serves both is a flake waiting for a loaded host.
+// Waiting for the marker also makes the check stronger than a timeout could: it
+// proves the runner was still blocked at a moment when the answer was fully
+// available to it.
 func TestRunCollectQuietWithoutCompletenessRuleWaitsForExit(t *testing.T) {
-	cli := writePrintThenHangCLI(t, quietTestJSON, "")
+	marker := filepath.Join(t.TempDir(), "answer-delivered")
+	cli := writeCLI(t, "#!/bin/sh\n"+
+		`printf '%s\n' '`+quietTestJSON+"'\n"+
+		"touch '"+marker+"'\n"+
+		"# The defining behaviour: answer delivered, process refuses to exit.\n"+
+		"sleep 300\n")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	out, _, _, err := RunCollectQuiet(ctx, nil, 0, nil, cli)
-	if err == nil {
-		t.Errorf("nil completeness rule still returned success (out=%q) — without "+
-			"a rule the runner must not decide the answer is finished",
-			truncateForLog(out))
+	type collected struct {
+		out []byte
+		err error
+	}
+	done := make(chan collected, 1)
+	go func() {
+		out, _, _, err := RunCollectQuiet(ctx, nil, 0, nil, cli)
+		done <- collected{out: out, err: err}
+	}()
+
+	waitForFile(t, marker, 30*time.Second)
+
+	// Well past the point where a rule-driven early return would have fired.
+	select {
+	case got := <-done:
+		t.Fatalf("returned while the process was still running (err=%v, out=%q) — "+
+			"without a rule the runner must not decide the answer is finished",
+			got.err, truncateForLog(got.out))
+	case <-time.After(3 * DefaultQuietIdleGrace):
+	}
+
+	cancel()
+	got := <-done
+	// Not a context sentinel: cancelling reaps the tree, and both entry points
+	// deliberately prefer the process error once they have one, because
+	// "signal: killed" is the more specific account of what happened. The
+	// invariant under test is only that success was never reported.
+	if got.err == nil {
+		t.Errorf("nil completeness rule still returned success (out=%q)", truncateForLog(got.out))
 	}
 	// The output is still handed back for a caller that wants to inspect it.
-	if !strings.Contains(string(out), quietTestJSON) {
-		t.Errorf("stdout = %q, want the captured bytes to survive the error", out)
+	if !strings.Contains(string(got.out), quietTestJSON) {
+		t.Errorf("stdout = %q, want the captured bytes to survive the error", got.out)
 	}
 }
 

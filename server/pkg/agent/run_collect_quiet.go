@@ -108,7 +108,7 @@ func RunCollectQuietCmd(ctx context.Context, cmd *exec.Cmd, env []string, idleGr
 		idleGrace = DefaultQuietIdleGrace
 	}
 
-	c, startErr := startCollector(ctx, cmd, env)
+	c, startErr := startCollector(cmd, env)
 	if startErr != nil {
 		return nil, "", false, startErr
 	}

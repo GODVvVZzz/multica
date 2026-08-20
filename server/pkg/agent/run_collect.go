@@ -105,7 +105,11 @@ type collector struct {
 // The caller must not have started it, and must leave Stdout/Stderr unset: this
 // package installs its own *os.File pipes, which is the whole reason Wait cannot
 // be held hostage by a descendant.
-func startCollector(ctx context.Context, cmd *exec.Cmd, env []string) (*collector, error) {
+//
+// No ctx parameter: the collector's lifetime is bounded by the callers below,
+// which select on ctx themselves. Taking one here would suggest this function
+// enforces it.
+func startCollector(cmd *exec.Cmd, env []string) (*collector, error) {
 	if env != nil {
 		cmd.Env = env
 	}
@@ -181,15 +185,22 @@ func (c *collector) finish() error {
 		// Bounded belt-and-braces: because this package owns the pipes, Wait is
 		// not being held open by a descendant, so it returns as soon as the
 		// direct child is gone — which reapProcessTree has just ensured.
-		waitUntil(c.waitDone, drainDeadline)
+		waitPending := !waitUntil(c.waitDone, drainDeadline)
 
+		drainForced := false
 		if !waitUntil(c.readers, drainDeadline) {
 			// A descendant we could not kill still holds a write end, so EOF
-			// will not arrive on its own. Close the read ends: the in-flight Read
-			// returns at once,
-			// which is what lets the wait below terminate. Returning here
-			// without that wait would leave io.Copy appending to a buffer the
-			// caller is about to read.
+			// will not arrive on its own. Close the read ends and wait for the
+			// absorb loops: returning without that wait would leave io.Copy
+			// appending to a buffer the caller is about to read.
+			//
+			// On Unix the close evicts a blocked Read, because the pipe is
+			// pollable. On Windows an anonymous pipe is not, so the close waits
+			// for the in-flight Read to release its reference — the wait below
+			// can then last until the descendant closes the write end. That is
+			// a slow return rather than a corrupt buffer, and it is only
+			// reachable when the tree kill above did not take.
+			drainForced = true
 			c.outR.Close()
 			c.errR.Close()
 			<-c.readers
@@ -201,6 +212,21 @@ func (c *collector) finish() error {
 		// still inside it, so it must not run while the tree could still be
 		// serving output.
 		releaseProcessGroup(c.cmd)
+
+		// Report, rather than swallow, a cleanup that did not converge. Both
+		// cases mean the OS refused to let us kill something, and both cost the
+		// caller something it would otherwise have no way to know about: an
+		// outstanding Wait, or output that may be truncated. Callers surface
+		// this through collectorError, so a command that failed on its own
+		// merits keeps its error and gains this one alongside it.
+		switch {
+		case waitPending:
+			c.finishErr = fmt.Errorf("collect cleanup: %s did not exit within %v of the tree kill, so its Wait is still outstanding",
+				c.cmd.Path, collectDrainGrace)
+		case drainForced:
+			c.finishErr = fmt.Errorf("collect cleanup: a descendant of %s still held the output pipe after %v, so the read ends were force-closed and trailing output may be missing",
+				c.cmd.Path, collectDrainGrace)
+		}
 	})
 	return c.finishErr
 }
@@ -264,7 +290,15 @@ func (c *collector) exitErr() (error, bool) {
 //     collectDrainGrace, whatever the CLI leaves behind.
 //  2. Descendants the CLI forked are killed before returning, so
 //     invoking a CLI on a timer cannot accumulate orphans.
-//  3. No goroutine outlives the call, on any platform.
+//  3. Whenever the tree is reaped successfully — which is every case the OS
+//     lets us have — the reader goroutines and cmd.Wait have all returned
+//     before this call does. If the kill does not take, finish() reports it
+//     (see there) and one goroutine can stay parked in cmd.Wait on a process
+//     nothing is able to terminate; that residue is not removable from here,
+//     which is why it is surfaced as an error instead of being asserted away.
+//     On Windows the same case can extend the call rather than leak, because an
+//     anonymous pipe is not pollable there and closing the read end waits for
+//     an in-flight Read to release it.
 //  4. The command's real exit status is reported, which openclawShimDiagnostic
 //     depends on (it type-switches on *exec.ExitError).
 //
@@ -282,14 +316,32 @@ func RunCollect(ctx context.Context, env []string, execPath string, args ...stri
 
 // RunCollectCmd is RunCollect for a caller that already holds a *exec.Cmd, which
 // is what Command.exec returns.
+//
+// ctx bounds the call on its own: it is not assumed that cmd was built with
+// exec.CommandContext. RunCollect's own cmd is, but a caller passing a plain
+// exec.Command would otherwise block here for as long as the CLI chose to run,
+// with the ctx argument doing nothing.
 func RunCollectCmd(ctx context.Context, cmd *exec.Cmd, env []string) (stdout []byte, stderr string, err error) {
-	c, startErr := startCollector(ctx, cmd, env)
+	c, startErr := startCollector(cmd, env)
 	if startErr != nil {
 		return nil, "", startErr
 	}
-	<-c.waitDone
-	finishErr := c.finish()
-	return c.stdout.snapshot(), string(c.stderr.snapshot()), collectorError(c.waitErr, finishErr)
+	select {
+	case <-c.waitDone:
+		finishErr := c.finish()
+		return c.stdout.snapshot(), string(c.stderr.snapshot()), collectorError(c.waitErr, finishErr)
+	case <-ctx.Done():
+		// Same ordering as RunCollectQuietCmd's deadline branch, so the two
+		// entry points cannot hand callers different error shapes for the same
+		// situation: prefer the process error once the tree has been reaped —
+		// "signal: killed" is worth keeping — and fall back to ctx.Err().
+		finishErr := c.finish()
+		out := c.stdout.snapshot()
+		if werr, reaped := c.exitErr(); reaped && werr != nil {
+			return out, string(c.stderr.snapshot()), collectorError(werr, finishErr)
+		}
+		return out, string(c.stderr.snapshot()), collectorError(ctx.Err(), finishErr)
+	}
 }
 
 // reapProcessTree SIGKILLs the process group led by cmd's child, so helpers the
