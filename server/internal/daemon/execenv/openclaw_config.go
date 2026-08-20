@@ -815,36 +815,8 @@ func openclawTildeRest(path string) (string, bool) {
 	return "", false
 }
 
-// openclawHomeRest recognizes the symbolic path shape emitted by current
-// OpenClaw releases when OPENCLAW_HOME is set. The CLI prints the variable name
-// rather than its value (for example `$OPENCLAW_HOME\.openclaw\openclaw.json`),
-// so treating that line as an ordinary relative path silently loses the user's
-// config. Both shell-style forms and host separators are accepted.
-func openclawHomeRest(path string) (string, bool) {
-	for _, prefix := range []string{"$OPENCLAW_HOME", "${OPENCLAW_HOME}"} {
-		if path == prefix {
-			return "", true
-		}
-		if len(path) > len(prefix) && strings.HasPrefix(path, prefix) &&
-			(path[len(prefix)] == '/' || path[len(prefix)] == '\\') {
-			return path[len(prefix)+1:], true
-		}
-	}
-	return "", false
-}
-
 func expandOpenclawPath(path string) (string, error) {
-	if rest, isOpenclawHome := openclawHomeRest(path); isOpenclawHome {
-		home := strings.TrimSpace(os.Getenv("OPENCLAW_HOME"))
-		if home == "" {
-			return "", fmt.Errorf("expand OPENCLAW_HOME in openclaw config path: environment variable is empty")
-		}
-		if rest == "" {
-			path = home
-		} else {
-			path = filepath.Join(home, rest)
-		}
-	} else if rest, isTilde := openclawTildeRest(path); isTilde {
+	if rest, isTilde := openclawTildeRest(path); isTilde {
 		home, herr := os.UserHomeDir()
 		if herr != nil {
 			return "", fmt.Errorf("expand `~` in openclaw config path: %w", herr)
@@ -1065,6 +1037,14 @@ func openclawLastNonEmptyLine(out string) string {
 // That leniency is fine once the command has finished; as a completeness rule it
 // would let the early return fire on the banner OpenClaw prints *before* the
 // path. Measured on 2026.5.27: the banner lands 54ms ahead of the path.
+//
+// The `$OPENCLAW_HOME\...` shape current releases print when that variable is
+// set is not recognized here, because nothing on `main` expands it either — a
+// rule that accepted it would hand the caller a path the parser then fails on.
+// The expansion is its own fix; this rule should learn the shape in the same
+// change that teaches expandOpenclawPath about it. Until then such a host loses
+// only the hang tolerance: no rule match means RunCollectQuiet waits for exit,
+// which is this function's documented conservative direction.
 func openclawConfigPathComplete(out []byte) bool {
 	line := openclawLastNonEmptyLine(string(out))
 	if line == "" {
@@ -1072,9 +1052,6 @@ func openclawConfigPathComplete(out []byte) bool {
 	}
 	if _, isTilde := openclawTildeRest(line); isTilde {
 		return true
-	}
-	if _, isOpenclawHome := openclawHomeRest(line); isOpenclawHome {
-		return filepath.IsAbs(strings.TrimSpace(os.Getenv("OPENCLAW_HOME")))
 	}
 	return filepath.IsAbs(line)
 }

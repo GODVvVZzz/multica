@@ -205,7 +205,6 @@ func TestExecOpenclawCLIDoesNotSalvagePartialJSON(t *testing.T) {
 // that an unknown shape gets none — which makes RunCollectQuiet wait for exit
 // rather than guess.
 func TestOpenclawOutputCompleteRules(t *testing.T) {
-	t.Setenv("OPENCLAW_HOME", t.TempDir())
 	banner := []byte("┌────┐\n│ hi │\n└────┘\n")
 	pathOut := []byte(string(banner) + "/root/.openclaw/openclaw.json\n")
 	partialJSON := []byte(`{"agents":[{"id":"a"},`)
@@ -226,7 +225,6 @@ func TestOpenclawOutputCompleteRules(t *testing.T) {
 		{"config file, path arrived", []string{"config", "file"}, pathOut, true},
 		{"config file, tilde path", []string{"config", "file"}, []byte("~/.openclaw/openclaw.json\n"), true},
 		{"config file, Windows tilde path", []string{"config", "file"}, []byte("~\\.openclaw\\openclaw.json\r\n"), true},
-		{"config file, OPENCLAW_HOME path", []string{"config", "file"}, []byte("$OPENCLAW_HOME\\.openclaw\\openclaw.json\r\n"), true},
 		{"config file, empty", []string{"config", "file"}, nil, false},
 		{"json, partial", []string{"config", "get", "--json"}, partialJSON, false},
 		{"json, complete", []string{"config", "get", "--json"}, fullJSON, true},

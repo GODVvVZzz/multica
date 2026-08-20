@@ -1837,36 +1837,6 @@ func TestExpandOpenclawPathTildeSeparators(t *testing.T) {
 	}
 }
 
-// TestExpandOpenclawPathOpenclawHome — current OpenClaw releases print the
-// variable name rather than its value when OPENCLAW_HOME is set, so the parser
-// has to expand that shape too. Treating it as an ordinary relative path
-// silently loses the user's config.
-func TestExpandOpenclawPathOpenclawHome(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("OPENCLAW_HOME", home)
-
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{name: "dollar Windows separator", in: `$OPENCLAW_HOME\.openclaw\openclaw.json`, want: filepath.Join(home, `.openclaw\openclaw.json`)},
-		{name: "braced POSIX separator", in: `${OPENCLAW_HOME}/.openclaw/openclaw.json`, want: filepath.Join(home, ".openclaw", "openclaw.json")},
-		{name: "bare variable", in: `$OPENCLAW_HOME`, want: home},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := expandOpenclawPath(tc.in)
-			if err != nil {
-				t.Fatalf("expandOpenclawPath(%q): %v", tc.in, err)
-			}
-			if got != tc.want {
-				t.Errorf("expandOpenclawPath(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestPrepareOpenclawConfigExpandsWindowsTilde — end-to-end guard for #6630:
 // the reporter's exact `openclaw config file` output (a config-warning banner
 // followed by a Windows-shortened path) must still produce a wrapper that
