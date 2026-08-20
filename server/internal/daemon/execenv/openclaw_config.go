@@ -1120,13 +1120,19 @@ func openclawLastNonEmptyLine(out string) string {
 // would let the early return fire on the banner OpenClaw prints *before* the
 // path. Measured on 2026.5.27: the banner lands 54ms ahead of the path.
 //
-// The `$OPENCLAW_HOME\...` shape current releases print when that variable is
-// set is not recognized here, because nothing on `main` expands it either — a
-// rule that accepted it would hand the caller a path the parser then fails on.
-// The expansion is its own fix; this rule should learn the shape in the same
-// change that teaches expandOpenclawPath about it. Until then such a host loses
-// only the hang tolerance: no rule match means RunCollectQuiet waits for exit,
-// which is this function's documented conservative direction.
+// The `$OPENCLAW_HOME\...` form counts as an answer once that variable resolves
+// to an absolute directory, which is the hand-off #7310 left here: while the
+// parser could not expand the shape, accepting it would have handed the caller a
+// path the parser then failed on, so this rule had to refuse it and such a host
+// lost the early return. #7310 made expandOpenclawPath understand it, so the
+// refusal is now the only thing standing between those hosts and the hang
+// tolerance the rest of this change exists for.
+//
+// Resolved through openclawHomeFromEnv rather than read raw from the
+// environment, because the value itself may be a tilde path that upstream
+// expands before printing (see there). Judging `~/svc` by filepath.IsAbs on the
+// raw string answers false and silently withholds the early return on exactly
+// the configuration #7310's review was about.
 func openclawConfigPathComplete(out []byte) bool {
 	line := openclawLastNonEmptyLine(string(out))
 	if line == "" {
@@ -1134,6 +1140,10 @@ func openclawConfigPathComplete(out []byte) bool {
 	}
 	if _, isTilde := openclawTildeRest(line); isTilde {
 		return true
+	}
+	if _, isOpenclawHome := openclawHomeRest(line); isOpenclawHome {
+		home, err := openclawHomeFromEnv()
+		return err == nil && filepath.IsAbs(home)
 	}
 	return filepath.IsAbs(line)
 }

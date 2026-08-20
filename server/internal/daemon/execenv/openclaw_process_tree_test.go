@@ -215,31 +215,69 @@ func TestOpenclawOutputCompleteRules(t *testing.T) {
 	// reported as `~/.openclaw/openclaw.json` under one HOME and as
 	// `/root/.openclaw/openclaw.json` under another (openclaw 2026.5.27). The daemon
 	// normally shares openclaw's HOME, so the tilde form is the common one.
+	//
+	// With OPENCLAW_HOME set, upstream prints that variable's name instead (see
+	// openclawHomeRest), so whether such a line is a finished answer depends on the
+	// environment too — env carries the value under test for those rows.
 	cases := []struct {
 		name string
+		env  map[string]string
 		args []string
 		out  []byte
 		want bool
 	}{
-		{"config file, banner only", []string{"config", "file"}, banner, false},
-		{"config file, path arrived", []string{"config", "file"}, pathOut, true},
-		{"config file, tilde path", []string{"config", "file"}, []byte("~/.openclaw/openclaw.json\n"), true},
-		{"config file, Windows tilde path", []string{"config", "file"}, []byte("~\\.openclaw\\openclaw.json\r\n"), true},
-		{"config file, empty", []string{"config", "file"}, nil, false},
-		{"json, partial", []string{"config", "get", "--json"}, partialJSON, false},
-		{"json, complete", []string{"config", "get", "--json"}, fullJSON, true},
-		{"json, null is a real answer", []string{"config", "get", "agents.list", "--json"}, []byte("null\n"), true},
-		{"json, empty", []string{"agents", "list", "--json"}, nil, false},
+		{name: "config file, banner only", args: []string{"config", "file"}, out: banner, want: false},
+		{name: "config file, path arrived", args: []string{"config", "file"}, out: pathOut, want: true},
+		{name: "config file, tilde path", args: []string{"config", "file"}, out: []byte("~/.openclaw/openclaw.json\n"), want: true},
+		{name: "config file, Windows tilde path", args: []string{"config", "file"}, out: []byte("~\\.openclaw\\openclaw.json\r\n"), want: true},
+		// The hand-off from #7310: the parser understands this shape now, so the
+		// rule may accept it and these hosts get the early return.
+		{
+			name: "config file, OPENCLAW_HOME path",
+			env:  map[string]string{"OPENCLAW_HOME": string(filepath.Separator) + "srv" + string(filepath.Separator) + "openclaw"},
+			args: []string{"config", "file"},
+			out:  []byte("$OPENCLAW_HOME\\.openclaw\\openclaw.json\r\n"),
+			want: true,
+		},
+		// A tilde-valued OPENCLAW_HOME resolves to an absolute directory, so the
+		// answer is finished. Judging the raw value with filepath.IsAbs would say
+		// false here and withhold the early return on exactly the configuration
+		// #7310's review was about.
+		{
+			name: "config file, tilde-valued OPENCLAW_HOME",
+			env:  map[string]string{"OPENCLAW_HOME": "~/svc"},
+			args: []string{"config", "file"},
+			out:  []byte("$OPENCLAW_HOME/.openclaw/openclaw.json\n"),
+			want: true,
+		},
+		// Nothing to resolve it to: not an answer, so the call waits for exit and
+		// the parser reports the real error rather than this rule guessing.
+		{
+			name: "config file, OPENCLAW_HOME unset",
+			env:  map[string]string{"OPENCLAW_HOME": ""},
+			args: []string{"config", "file"},
+			out:  []byte("$OPENCLAW_HOME/.openclaw/openclaw.json\n"),
+			want: false,
+		},
+		{name: "config file, empty", args: []string{"config", "file"}, out: nil, want: false},
+		{name: "json, partial", args: []string{"config", "get", "--json"}, out: partialJSON, want: false},
+		{name: "json, complete", args: []string{"config", "get", "--json"}, out: fullJSON, want: true},
+		{name: "json, null is a real answer", args: []string{"config", "get", "agents.list", "--json"}, out: []byte("null\n"), want: true},
+		{name: "json, empty", args: []string{"agents", "list", "--json"}, out: nil, want: false},
 	}
 	for _, tc := range cases {
-		rule := openclawOutputComplete(tc.args)
-		if rule == nil {
-			t.Errorf("%s: no completeness rule for %v", tc.name, tc.args)
-			continue
-		}
-		if got := rule(tc.out); got != tc.want {
-			t.Errorf("%s: rule(%q) = %v, want %v", tc.name, tc.out, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			rule := openclawOutputComplete(tc.args)
+			if rule == nil {
+				t.Fatalf("no completeness rule for %v", tc.args)
+			}
+			if got := rule(tc.out); got != tc.want {
+				t.Errorf("rule(%q) = %v, want %v", tc.out, got, tc.want)
+			}
+		})
 	}
 
 	if rule := openclawOutputComplete([]string{"doctor"}); rule != nil {
