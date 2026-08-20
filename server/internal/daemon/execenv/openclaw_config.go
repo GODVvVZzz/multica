@@ -371,12 +371,14 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 	// config via `$include` would let user-only entries leak in (and an empty
 	// managed set would not actually clear inherited servers).
 	//
-	// Current OpenClaw releases do not answer the resolved-root form this used
-	// to use (`config get --json` with no path): measured against 2026.5.27 it
-	// writes zero bytes to stdout and never exits, and the same shape is
-	// reported against 2026.7.1-2. On those hosts every managed-MCP task fails
-	// preparation. `config get mcp --json` is answered, so ask for the subtree
-	// that is actually needed and build a three-stage include:
+	// The resolved-root form this used to use (`config get --json` with no path)
+	// is not reliably answered: measured against 2026.5.27 it writes zero bytes
+	// to stdout and never exits, which fails preparation for every managed-MCP
+	// task on such a host. Scoped to that measurement deliberately — the field
+	// reports on 2026.7.1-2 are about `config file`, not this read, so the root
+	// read's behaviour there is unmeasured. `config get mcp --json` is answered,
+	// and is also the only part this code needs, so ask for the subtree and build
+	// a three-stage include:
 	//
 	//  1. include the user's full config,
 	//  2. merge `mcp: null` to replace its MCP object wholesale,
@@ -891,12 +893,15 @@ func isOpenclawConfigFileUnsupported(err error) bool {
 // env-substitution, so this is the user's effective MCP settings with the
 // sibling tuning (`sessionIdleTtlMs` and friends) the wrapper has to preserve.
 //
-// The subtree rather than the root: `config get --json` with no key path is not
-// answered by current releases. Measured against 2026.5.27 it writes nothing to
-// stdout and never exits, which makes reading the root a preparation timeout for
-// every managed-MCP task; the same shape is reported against 2026.7.1-2. Asking
-// for the subtree that is actually needed also keeps the user's API keys and
-// provider tokens out of this process entirely.
+// The subtree rather than the root: `config get --json` with no key path was
+// measured against 2026.5.27 writing nothing to stdout and never exiting, which
+// makes reading the root a preparation timeout for every managed-MCP task on
+// such a host. That is one release on one host and is not generalized here: the
+// field reports on 2026.7.1-2 (#6275, #7308) both concern `config file`, so what
+// the root read does on that version is unmeasured. The subtree is the right
+// target regardless — it is the only part of the configuration this code needs,
+// which also keeps the user's API keys and provider tokens out of this process
+// entirely.
 //
 // A missing key is not an error: a config with no `mcp` block at all answers
 // "path not found", which means there is nothing to preserve.
