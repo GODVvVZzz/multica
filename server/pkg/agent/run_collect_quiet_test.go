@@ -34,8 +34,10 @@ func writePrintThenHangCLI(t *testing.T, payload, helperPidFile string) string {
 	script := filepath.Join(dir, "fake-cli")
 	fork := ""
 	if helperPidFile != "" {
-		fork = `( echo $$ > "` + helperPidFile + `"; sleep 300 ) &
-while [ ! -s "` + helperPidFile + `" ]; do sleep 0.01; done
+		// $!, not $$ from inside a subshell: see writeForkingCLIOutput. Naming
+		// the direct child here would make the reaping assertion vacuous.
+		fork = `sleep 300 &
+echo $! > "` + helperPidFile + `"
 `
 	}
 	body := "#!/bin/sh\n" + fork + `printf '%s\n' '` + payload + `'

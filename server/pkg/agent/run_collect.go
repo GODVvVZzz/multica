@@ -13,11 +13,33 @@ import (
 	"time"
 )
 
-// collectDrainGrace bounds the total cleanup wait in finish(): the direct child
-// must be reaped and the reader goroutines must see EOF within this one budget.
-// If a descendant escaped the platform process-tree boundary, finish closes the
-// read ends outright when the budget expires.
-const collectDrainGrace = 5 * time.Second
+// collectReapWindow bounds how long finish() keeps re-signalling the process
+// tree, and collectReapStep is the interval between passes.
+//
+// One pass is not enough. A descendant whose fork completes between the kill's
+// enumeration of the group and the signal's delivery never receives it, and only
+// a later pass reaches it — measured 3 misses in 10 runs of the forking stub in
+// run_collect_test.go, each leaving a `sleep 300` reparented to init. The window
+// only has to cover that fork, so it is deliberately short: retrying for longer
+// would widen the pid-reuse window documented on reapProcessTree, since the group
+// id is the pid Wait has already reaped.
+const (
+	collectReapWindow = 100 * time.Millisecond
+	collectReapStep   = 10 * time.Millisecond
+)
+
+// collectSettleGrace bounds the one cleanup wait on the answer path: after the
+// tree has been signalled, how long finish() waits for the reader goroutines to
+// see EOF before handing the caller what arrived.
+//
+// Short on purpose, and it cannot truncate a well-behaved CLI's answer. Once the
+// direct child has exited, at most one pipe buffer of its output can still be
+// unread — a child that had written more than that would have blocked in write()
+// and could not have exited — and that is drained at memory speed. What the cap
+// cuts short is a descendant that inherited the pipe and holds it open, whose
+// trailing output is not the answer. EOF short-circuits the wait, so the normal
+// case pays nothing at all.
+const collectSettleGrace = 400 * time.Millisecond
 
 // outputBuffer accumulates one stream and records when the last write landed.
 //
@@ -89,10 +111,9 @@ type collector struct {
 	stdout     outputBuffer
 	stderr     outputBuffer
 
-	readers   chan struct{} // closed once both absorb loops have returned
-	waitDone  chan struct{} // closed once cmd.Wait has returned
-	waitErr   error         // valid after waitDone is closed
-	finishErr error         // valid after finishOnce has run
+	readers  chan struct{} // closed once both absorb loops have returned
+	waitDone chan struct{} // closed once cmd.Wait has returned
+	waitErr  error         // valid after waitDone is closed
 
 	finishOnce sync.Once
 }
@@ -168,44 +189,48 @@ func startCollector(cmd *exec.Cmd, env []string) (*collector, error) {
 	return c, nil
 }
 
-// finish reaps the process tree and guarantees that once it returns, no
-// goroutine started by startCollector is still running and nothing can still
-// append to the buffers — so the caller may snapshot them without racing.
+// finish reaps the process tree and leaves the buffers in the most complete
+// state it can reach within collectSettleGrace, so a caller may snapshot them
+// straight afterwards.
+//
+// It deliberately reports nothing. Cleanup that does not converge means the OS
+// refused to kill something; that is worth a log line, but it must not decide
+// whether the caller gets the answer. A version probe whose output arrived and
+// whose helper the kernel would not kill is exactly the case #6084's cmd.WaitDelay
+// got wrong — it failed a probe that had succeeded, and a failed version probe
+// skips runtime registration entirely.
 //
 // Safe to call more than once and from any of the caller's exit paths.
-func (c *collector) finish() error {
+func (c *collector) finish() {
 	c.finishOnce.Do(func() {
-		drainDeadline := time.Now().Add(collectDrainGrace)
 		// Reap whatever the CLI forked, on the success path too: a successful
 		// `openclaw --version` still leaves its helper behind, which is how
 		// orphans accumulate on a host that probes on a timer. This also
 		// releases the last write end so the readers below can see EOF.
-		reapProcessTree(c.cmd)
-
-		// Bounded belt-and-braces: because this package owns the pipes, Wait is
-		// not being held open by a descendant, so it returns as soon as the
-		// direct child is gone — which reapProcessTree has just ensured.
-		waitPending := !waitUntil(c.waitDone, drainDeadline)
-
-		drainForced := false
-		if !waitUntil(c.readers, drainDeadline) {
-			// A descendant we could not kill still holds a write end, so EOF
-			// will not arrive on its own. Close the read ends and wait for the
-			// absorb loops: returning without that wait would leave io.Copy
-			// appending to a buffer the caller is about to read.
-			//
-			// On Unix the close evicts a blocked Read, because the pipe is
-			// pollable. On Windows an anonymous pipe is not, so the close waits
-			// for the in-flight Read to release its reference — the wait below
-			// can then last until the descendant closes the write end. That is
-			// a slow return rather than a corrupt buffer, and it is only
-			// reachable when the tree kill above did not take.
-			drainForced = true
-			c.outR.Close()
-			c.errR.Close()
-			<-c.readers
+		//
+		// Retried across collectReapWindow because a single pass loses a
+		// descendant that was mid-fork when the signal went out; see there.
+		reapKill(c.cmd)
+		treeGone := waitProcessGroupGone(c.cmd, collectReapStep)
+		for reapDeadline := time.Now().Add(collectReapWindow); !treeGone && time.Now().Before(reapDeadline); {
+			reapKill(c.cmd)
+			treeGone = waitProcessGroupGone(c.cmd, collectReapStep)
 		}
 
+		// Because this package owns the pipes, Wait is not being held open by a
+		// descendant: it returns as soon as the direct child is gone, which the
+		// kill above has just ensured.
+		settleDeadline := time.Now().Add(collectSettleGrace)
+		waitReturned := waitUntil(c.waitDone, settleDeadline)
+		drained := waitUntil(c.readers, settleDeadline)
+
+		// Stop reading either way. Nothing is waited on here: on Windows an
+		// anonymous pipe is not pollable, so closing the read end does not evict
+		// a blocked Read and waiting for the absorb loop would park this call for
+		// as long as the surviving descendant felt like living. The loops are
+		// harmless — snapshot takes the buffer's mutex, so one still appending
+		// cannot race a caller reading it — and they end when the descendant
+		// finally does.
 		c.outR.Close()
 		c.errR.Close()
 		// Only now: on Windows closing the job handle is what kills anything
@@ -213,23 +238,21 @@ func (c *collector) finish() error {
 		// serving output.
 		releaseProcessGroup(c.cmd)
 
-		// Report, rather than swallow, a cleanup that did not converge. Both
-		// cases mean the OS refused to let us kill something, and both cost the
-		// caller something it would otherwise have no way to know about: an
-		// outstanding Wait, or output that may be truncated. Callers surface
-		// this through collectorError, so a command that failed on its own
-		// merits keeps its error and gains this one alongside it.
-		switch {
-		case waitPending:
-			c.finishErr = fmt.Errorf("collect cleanup: %s did not exit within %v of the tree kill, so its Wait is still outstanding",
-				c.cmd.Path, collectDrainGrace)
-		case drainForced:
-			c.finishErr = fmt.Errorf("collect cleanup: a descendant of %s still held the output pipe after %v, so the read ends were force-closed and trailing output may be missing",
-				c.cmd.Path, collectDrainGrace)
+		if !treeGone || !drained || !waitReturned {
+			slog.Default().Warn("agent: collect cleanup did not converge",
+				"command", c.cmd.Path,
+				"tree_gone", treeGone,
+				"output_drained", drained,
+				"wait_returned", waitReturned,
+				"window", collectReapWindow,
+				"settle_grace", collectSettleGrace)
 		}
 	})
-	return c.finishErr
 }
+
+// reapKill is the process-tree kill, indirected so a test can make one pass miss
+// and prove the retry in finish() is what recovers. Production never reassigns it.
+var reapKill = reapProcessTree
 
 func waitUntil(done <-chan struct{}, deadline time.Time) bool {
 	select {
@@ -249,16 +272,6 @@ func waitUntil(done <-chan struct{}, deadline time.Time) bool {
 	case <-timer.C:
 		return false
 	}
-}
-
-func collectorError(commandErr, cleanupErr error) error {
-	if cleanupErr == nil {
-		return commandErr
-	}
-	if commandErr == nil {
-		return cleanupErr
-	}
-	return errors.Join(commandErr, cleanupErr)
 }
 
 // exitErr reports the command's exit error without blocking, and whether the
@@ -287,18 +300,16 @@ func (c *collector) exitErr() (error, bool) {
 // Guarantees callers depend on:
 //
 //  1. Returns within roughly the caller's context deadline plus
-//     collectDrainGrace, whatever the CLI leaves behind.
-//  2. Descendants the CLI forked are killed before returning, so
-//     invoking a CLI on a timer cannot accumulate orphans.
-//  3. Whenever the tree is reaped successfully — which is every case the OS
-//     lets us have — the reader goroutines and cmd.Wait have all returned
-//     before this call does. If the kill does not take, finish() reports it
-//     (see there) and one goroutine can stay parked in cmd.Wait on a process
-//     nothing is able to terminate; that residue is not removable from here,
-//     which is why it is surfaced as an error instead of being asserted away.
-//     On Windows the same case can extend the call rather than leak, because an
-//     anonymous pipe is not pollable there and closing the read end waits for
-//     an in-flight Read to release it.
+//     collectReapWindow and collectSettleGrace, whatever the CLI leaves behind.
+//  2. Descendants the CLI forked are signalled before returning, and the signal
+//     is repeated across collectReapWindow so one that was mid-fork does not
+//     escape — invoking a CLI on a timer cannot accumulate orphans.
+//  3. Whenever the tree is reaped successfully — which is every case the OS lets
+//     us have — the reader goroutines and cmd.Wait have all returned before this
+//     call does. If the kill does not take, the residue is logged and the answer
+//     is still returned: a goroutine can stay parked reading a pipe a surviving
+//     descendant holds, and that is not removable from here. It is deliberately
+//     not reported as a call failure — see finish().
 //  4. The command's real exit status is reported, which openclawShimDiagnostic
 //     depends on (it type-switches on *exec.ExitError).
 //
@@ -307,6 +318,12 @@ func (c *collector) exitErr() (error, bool) {
 // Not for agent execution: those paths stream stdout incrementally and manage
 // their own lifecycle. Use this for one-shot, read-only invocations
 // (`--version`, `agents list`, `config get`).
+//
+// This path-taking form has no production caller yet — the three call sites this
+// change converts already hold a *exec.Cmd and use RunCollectCmd. It is the
+// entry point for the remaining cmd.Output() call sites in this package
+// (models.go's catalog probes, codex.go, deveco_models.go, thinking.go), which
+// carry the same shape and are deliberately out of scope here.
 func RunCollect(ctx context.Context, env []string, execPath string, args ...string) (stdout []byte, stderr string, err error) {
 	// Command.exec, not exec.CommandContext: launch.go owns process construction
 	// so a custom runtime's fixed_args prefix cannot be dropped (GH #7046). A zero
@@ -328,19 +345,19 @@ func RunCollectCmd(ctx context.Context, cmd *exec.Cmd, env []string) (stdout []b
 	}
 	select {
 	case <-c.waitDone:
-		finishErr := c.finish()
-		return c.stdout.snapshot(), string(c.stderr.snapshot()), collectorError(c.waitErr, finishErr)
+		c.finish()
+		return c.stdout.snapshot(), string(c.stderr.snapshot()), c.waitErr
 	case <-ctx.Done():
 		// Same ordering as RunCollectQuietCmd's deadline branch, so the two
 		// entry points cannot hand callers different error shapes for the same
 		// situation: prefer the process error once the tree has been reaped —
 		// "signal: killed" is worth keeping — and fall back to ctx.Err().
-		finishErr := c.finish()
+		c.finish()
 		out := c.stdout.snapshot()
 		if werr, reaped := c.exitErr(); reaped && werr != nil {
-			return out, string(c.stderr.snapshot()), collectorError(werr, finishErr)
+			return out, string(c.stderr.snapshot()), werr
 		}
-		return out, string(c.stderr.snapshot()), collectorError(ctx.Err(), finishErr)
+		return out, string(c.stderr.snapshot()), ctx.Err()
 	}
 }
 

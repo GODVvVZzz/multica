@@ -24,8 +24,11 @@ import (
 //
 //   - the call returns rather than parking on a CLI that will not exit;
 //   - the output captured before that is complete and correct;
-//   - no goroutine started by startCollector outlives the call, so a daemon
-//     invoking these helpers on a timer cannot accumulate parked goroutines.
+//   - no goroutine started by startCollector outlives the call whenever the Job
+//     Object kill takes, so a daemon invoking these helpers on a timer cannot
+//     accumulate parked goroutines. A process the OS refuses to terminate is out
+//     of scope here, as it is on Unix: finish() logs that and still returns the
+//     answer.
 //
 // execenv/isolation_windows_test.go separately pins the outer Job Object around
 // the complete task-preparation helper.

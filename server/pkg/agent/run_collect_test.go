@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -41,11 +42,12 @@ func writeForkingCLIOutput(t *testing.T, pidFile, output string) string {
 	body := `#!/bin/sh
 # The helper keeps the inherited stdout/stderr open — the exact shape that
 # makes cmd.Output() wait for a process it never spawned.
-( echo $$ > "` + pidFile + `"; sleep 300 ) &
-# Block until the helper has recorded its pid. Without this the parent can exit
-# (and the group be reaped) before the helper ever runs, leaving the test with
-# no pid to assert on — the reaping is fast enough for that race to fire.
-while [ ! -s "` + pidFile + `" ]; do sleep 0.01; done
+sleep 300 &
+# $!, not $$ from inside a subshell: POSIX keeps $$ at the invoking shell's pid
+# even inside ( ), so recording it would name the direct child — which cmd.Wait
+# reaps regardless of whether the tree kill works, making every assertion built
+# on this file vacuous.
+echo $! > "` + pidFile + `"
 echo "` + output + `"
 exit 0
 `
@@ -208,10 +210,47 @@ func TestRunCollectSurfacesStderrAndExitStatus(t *testing.T) {
 	}
 }
 
-func TestCollectorErrorPreservesCommandErrorWithoutCleanupFailure(t *testing.T) {
-	want := &exec.ExitError{}
-	if got := collectorError(want, nil); got != want {
-		t.Fatalf("collectorError(command, nil) = %T %v, want original *exec.ExitError", got, got)
+// TestRunCollectRetriesTheTreeKill pins the retry, which is not decoration: a
+// single pass loses a descendant whose fork completes between the kill's
+// enumeration of the process group and the signal's delivery. Measured 3 misses
+// in 10 runs of the forking stub, each leaving a `sleep 300` reparented to init
+// and the call stalled until the settle grace expired.
+//
+// The race cannot be forced from a stub — it lives inside one syscall — so the
+// missed pass is injected here instead. Same var-for-tests pattern as
+// detectVersionTimeout and openclawExec.
+func TestRunCollectRetriesTheTreeKill(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "helper.pid")
+	cli := writeForkingCLI(t, pidFile)
+
+	original := reapKill
+	var passes int32
+	reapKill = func(cmd *exec.Cmd) {
+		// The first pass misses exactly the way the enumeration race does: the
+		// signal is issued and reaches nothing.
+		if atomic.AddInt32(&passes, 1) > 1 {
+			original(cmd)
+		}
+	}
+	t.Cleanup(func() { reapKill = original })
+
+	out, _, err := RunCollect(context.Background(), nil, cli)
+	if err != nil {
+		t.Fatalf("RunCollect returned an error: %v", err)
+	}
+	if !strings.Contains(string(out), "fake-cli 1.2.3") {
+		t.Errorf("stdout did not survive: %q", out)
+	}
+
+	pid := waitForPidFile(t, pidFile)
+	if !waitForProcessGone(pid, 5*time.Second) {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatalf("helper (pid %d) survived a missed first kill — one pass is "+
+			"all the tree gets, so a descendant that was mid-fork stays an orphan", pid)
+	}
+	if got := atomic.LoadInt32(&passes); got < 2 {
+		t.Errorf("kill passes = %d, want at least 2 — the retry never ran, so "+
+			"this test passed for the wrong reason", got)
 	}
 }
 
@@ -302,7 +341,8 @@ func assertNoGoroutineGrowth(t *testing.T, before int) {
 //
 // Scope: this proves convergence for a tree the kill reaches, which is the case
 // the fix is about. It does not — and cannot — prove anything about a process
-// the OS refuses to terminate; finish() reports that case instead of hiding it.
+// the OS refuses to terminate; finish() logs that case and still returns the
+// answer, rather than reporting it as a failed call.
 func TestRunCollectLeavesNoGoroutines(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "helper.pid")
 	cli := writeForkingCLI(t, pidFile)

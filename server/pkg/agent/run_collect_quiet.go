@@ -121,11 +121,11 @@ func RunCollectQuietCmd(ctx context.Context, cmd *exec.Cmd, env []string, idleGr
 		case <-c.waitDone:
 			// Clean exit, or a real non-zero one: the normal path, and it pays
 			// no idle wait at all.
-			finishErr := c.finish()
-			return c.stdout.snapshot(), string(c.stderr.snapshot()), false, collectorError(c.waitErr, finishErr)
+			c.finish()
+			return c.stdout.snapshot(), string(c.stderr.snapshot()), false, c.waitErr
 
 		case <-ctx.Done():
-			finishErr := c.finish()
+			c.finish()
 			out := c.stdout.snapshot()
 			// Deliberately no salvage. Reaching the deadline means we never saw
 			// output that `complete` accepted, so by the caller's own rule the
@@ -133,9 +133,9 @@ func RunCollectQuietCmd(ctx context.Context, cmd *exec.Cmd, env []string, idleGr
 			// callers attribute ctx themselves and a "signal: killed" detail is
 			// worth keeping in the message.
 			if werr, reaped := c.exitErr(); reaped && werr != nil {
-				return out, string(c.stderr.snapshot()), true, collectorError(werr, finishErr)
+				return out, string(c.stderr.snapshot()), true, werr
 			}
-			return out, string(c.stderr.snapshot()), true, collectorError(ctx.Err(), finishErr)
+			return out, string(c.stderr.snapshot()), true, ctx.Err()
 
 		case <-ticker.C:
 			if complete == nil {
@@ -150,8 +150,11 @@ func RunCollectQuietCmd(ctx context.Context, cmd *exec.Cmd, env []string, idleGr
 				continue
 			}
 			// A finished answer that has gone quiet: take it and reap the tree.
-			finishErr := c.finish()
-			return out, string(c.stderr.snapshot()), true, finishErr
+			// `out` is the buffer `complete` accepted, deliberately not a fresh
+			// snapshot — bytes a lingering descendant appends after that verdict
+			// were never part of the answer and could only break the parse.
+			c.finish()
+			return out, string(c.stderr.snapshot()), true, nil
 		}
 	}
 }
