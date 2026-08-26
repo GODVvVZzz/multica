@@ -1222,6 +1222,83 @@ func TestPrepareOpenclawConfigFailsClosedOnResolvedMcpError(t *testing.T) {
 	}
 }
 
+// TestPrepareOpenclawConfigTreatsMissingMcpKeyAsEmpty pins the missing-key
+// contracts used by supported OpenClaw releases. A user config with no `mcp`
+// block has no sibling settings to preserve; managed tasks must still prepare
+// an include chain that resets inherited MCP state and contributes only the
+// managed server set.
+func TestPrepareOpenclawConfigTreatsMissingMcpKeyAsEmpty(t *testing.T) {
+	cases := []struct {
+		name     string
+		response openclawResponse
+	}{
+		{
+			name: "2026.6 stderr text",
+			response: openclawResponse{
+				err: errors.New("openclaw config get mcp --json: exit status 1 (stderr: Config path not found: mcp. Run openclaw config validate to inspect config shape.)"),
+			},
+		},
+		{
+			name: "2026.7 legacy json envelope",
+			response: openclawResponse{
+				stdout: `{"error":"Config path not found: mcp"}`,
+				err:    errors.New("openclaw config get mcp --json: exit status 1"),
+			},
+		},
+		{
+			name: "2026.8 nested json envelope",
+			response: openclawResponse{
+				stdout: `{"ok":false,"error":{"type":"cli_error","message":"Config path is valid but unset: mcp. The runtime default applies."}}`,
+				err:    errors.New("openclaw config get mcp --json: exit status 1"),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envRoot := t.TempDir()
+			workDir := filepath.Join(envRoot, "workdir")
+			if err := os.MkdirAll(workDir, 0o755); err != nil {
+				t.Fatalf("mkdir workdir: %v", err)
+			}
+			userCfgPath := filepath.Join(t.TempDir(), "openclaw.json")
+			if err := os.WriteFile(userCfgPath, []byte(`{"gateway":{"mode":"local"}}`), 0o600); err != nil {
+				t.Fatalf("write user cfg: %v", err)
+			}
+			stub := installOpenclawStub(t, map[string]openclawResponse{
+				"config file":                   {stdout: userCfgPath},
+				"config get agents.list --json": {stdout: "null"},
+				"config get mcp --json":         tc.response,
+			})
+
+			result, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{
+				OpenclawBin: stub.bin,
+				McpConfig:   json.RawMessage(`{"mcpServers":{"managed":{"command":"managed"}}}`),
+			})
+			if err != nil {
+				t.Fatalf("prepareOpenclawConfig: %v", err)
+			}
+
+			wrapper := mustReadJSON(t, result.ConfigPath)
+			mcp, ok := wrapper["mcp"].(map[string]any)
+			if !ok {
+				t.Fatalf("wrapper missing managed mcp block: %v", wrapper)
+			}
+			servers, ok := mcp["servers"].(map[string]any)
+			if !ok || len(servers) != 1 || servers["managed"] == nil {
+				t.Fatalf("managed servers = %#v, want only managed", mcp["servers"])
+			}
+			snapshot := mustReadJSON(t, filepath.Join(envRoot, openclawUserSnapshotFile))
+			if _, present := snapshot["mcp"]; present {
+				t.Fatalf("missing user mcp should not synthesize preserved siblings: %v", snapshot["mcp"])
+			}
+			reset := mustReadJSON(t, filepath.Join(envRoot, openclawMcpResetFile))
+			if value, present := reset["mcp"]; !present || value != nil {
+				t.Fatalf("mcp reset = %#v, want explicit null", reset)
+			}
+		})
+	}
+}
+
 // TestPrepareOpenclawConfigFailsClosedOnMalformedMcpConfig — keeping with
 // the fail-closed posture used for the rest of the preparer: a malformed
 // mcp_config must not write any wrapper file, so the daemon surfaces the
@@ -1575,72 +1652,134 @@ func TestIsOpenclawKeyMissing(t *testing.T) {
 	}
 }
 
-// TestIsOpenclawKeyMissingResult covers the JSON error contract observed in
-// OpenClaw 2026.7.2-beta.7. In JSON mode the CLI writes the missing-path error
-// to stdout and leaves stderr empty, so the process error alone contains only
-// "exit status 1". Only a structured missing-path envelope may trigger the
-// registry fallback; other failures must preserve the preparer's fail-closed
-// posture.
+// TestIsOpenclawKeyMissingResult covers both JSON error contracts observed in
+// OpenClaw: 2026.7.2-beta.7 writes a string `error`, while 2026.8.1-beta.3
+// writes `error.message` and distinguishes valid-but-unset from unknown paths.
+// Only a structured missing-path message for the requested path may trigger a
+// fallback; other failures must preserve the preparer's fail-closed posture.
 func TestIsOpenclawKeyMissingResult(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name   string
 		stdout string
 		err    error
+		path   string
 		want   bool
 	}{
 		{
 			name:   "2026.7.2-beta.7 stdout json missing path",
 			stdout: `{"error":"Config path not found: agents.list"}`,
 			err:    errors.New("openclaw config get agents.list --json: exit status 1"),
+			path:   "agents.list",
+			want:   true,
+		},
+		{
+			name:   "2026.8.1-beta.3 nested json unknown path",
+			stdout: `{"ok":false,"error":{"type":"cli_error","message":"Unknown config path: agents.list. Run openclaw config schema to inspect valid paths."}}`,
+			err:    errors.New("openclaw config get agents.list --json: exit status 1"),
+			path:   "agents.list",
+			want:   true,
+		},
+		{
+			name:   "2026.8.1-beta.3 nested json valid but unset",
+			stdout: `{"ok":false,"error":{"type":"cli_error","message":"Config path is valid but unset: mcp. The runtime default applies."}}`,
+			err:    errors.New("openclaw config get mcp --json: exit status 1"),
+			path:   "mcp",
 			want:   true,
 		},
 		{
 			name: "2026.6.x stderr missing path remains supported",
 			err:  errors.New("openclaw config get agents.list --json: exit status 1 (stderr: Config path not found: agents.list)"),
+			path: "agents.list",
 			want: true,
 		},
 		{
 			name:   "other json error stays an error",
 			stdout: `{"error":"OpenClaw config is invalid"}`,
 			err:    errors.New("openclaw config get agents.list --json: exit status 1"),
+			path:   "agents.list",
 			want:   false,
 		},
 		{
 			name:   "unrelated not-set json error stays an error",
 			stdout: `{"error":"OPENAI_API_KEY is not set"}`,
 			err:    errors.New("openclaw config get agents.list --json: exit status 1"),
+			path:   "agents.list",
+			want:   false,
+		},
+		{
+			name: "unrelated not-set process error stays an error",
+			err:  errors.New("openclaw config get agents.list --json: exit status 1 (stderr: OPENAI_API_KEY is not set)"),
+			path: "agents.list",
+			want: false,
+		},
+		{
+			name: "environment variable suffix resembling path stays an error",
+			err:  errors.New("openclaw config get mcp --json: exit status 1 (stderr: OPENCLAW_MCP is not set)"),
+			path: "mcp",
+			want: false,
+		},
+		{
+			name:   "parent path suffix resembling path stays an error",
+			stdout: `{"error":"parent.mcp is not set"}`,
+			err:    errors.New("openclaw config get mcp --json: exit status 1"),
+			path:   "mcp",
 			want:   false,
 		},
 		{
 			name:   "agents-list not-set json error remains compatible",
 			stdout: `{"error":"agents.list is not set"}`,
 			err:    errors.New("openclaw config get agents.list --json: exit status 1"),
+			path:   "agents.list",
 			want:   true,
+		},
+		{
+			name:   "different missing path stays an error",
+			stdout: `{"error":"Config path not found: agents.list"}`,
+			err:    errors.New("openclaw config get mcp --json: exit status 1"),
+			path:   "mcp",
+			want:   false,
+		},
+		{
+			name:   "longer path sharing a prefix stays an error",
+			stdout: `{"error":"Config path not found: mcp.apps"}`,
+			err:    errors.New("openclaw config get mcp --json: exit status 1"),
+			path:   "mcp",
+			want:   false,
 		},
 		{
 			name:   "malformed json stays an error",
 			stdout: `{"error":`,
 			err:    errors.New("openclaw config get agents.list --json: exit status 1"),
+			path:   "agents.list",
 			want:   false,
 		},
 		{
 			name:   "successful output is never reclassified",
 			stdout: `{"error":"Config path not found: agents.list"}`,
+			path:   "agents.list",
 			want:   false,
 		},
 		{
 			name:   "timeout remains a timeout",
 			stdout: `{"error":"Config path not found: agents.list"}`,
 			err:    fmt.Errorf("openclaw config get agents.list --json: %w (stderr: Config path not found: agents.list)", context.DeadlineExceeded),
+			path:   "agents.list",
+			want:   false,
+		},
+		{
+			name:   "cancellation remains a cancellation",
+			stdout: `{"error":"Config path not found: mcp"}`,
+			err:    fmt.Errorf("openclaw config get mcp --json: %w", context.Canceled),
+			path:   "mcp",
 			want:   false,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := isOpenclawKeyMissingResult(tc.stdout, tc.err); got != tc.want {
-				t.Errorf("isOpenclawKeyMissingResult(%q, %v) = %v, want %v", tc.stdout, tc.err, got, tc.want)
+			if got := isOpenclawKeyMissingResult(tc.stdout, tc.err, tc.path); got != tc.want {
+				t.Errorf("isOpenclawKeyMissingResult(%q, %v, %q) = %v, want %v", tc.stdout, tc.err, tc.path, got, tc.want)
 			}
 		})
 	}

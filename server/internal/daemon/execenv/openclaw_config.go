@@ -537,19 +537,20 @@ func discoverOpenclawConfig(bin string, timeout time.Duration, opts OpenclawConf
 // $include here, so this is not the silent-fallback case the reviewer
 // flagged.
 //
-// snapshotPath, when non-empty, points at a sanitized copy of the user's
-// resolved config (mcp stripped) sitting in envRoot. It is the $include
-// target whenever the agent has a managed mcp_config — the live user file
-// would otherwise leak global `mcp.servers` past the wrapper. When
-// snapshotPath is empty the wrapper falls back to $include'ing the active
-// path so secrets / nested includes stay in the user's own file (no
-// managed mcp means there is nothing to enforce strictness against).
+// snapshotPath, when non-empty, points at an include chain in envRoot. The
+// chain includes the live user config, resets its `mcp` object, then restores
+// only the resolved non-server MCP settings. It is the $include target whenever
+// the agent has a managed mcp_config; otherwise the live user file would leak
+// global `mcp.servers` past the wrapper. When snapshotPath is empty the wrapper
+// falls back to $include'ing the active path so secrets / nested includes stay
+// in the user's own file (no managed mcp means there is nothing to enforce
+// strictness against).
 //
 // hasManagedMcp distinguishes "agent has a managed mcp_config (possibly an
 // empty set)" from "agent inherits the user's global mcp.servers". When
-// true we pin `mcp.servers` to managedMcp on the wrapper. Because the
-// snapshot $include has already dropped the user's `mcp` block, the
-// resulting view of `mcp.servers` is exactly the managed set — including
+// true we pin `mcp.servers` to managedMcp on the wrapper. Because the reset
+// stage in the snapshot chain has already replaced the user's `mcp` block,
+// the resulting view of `mcp.servers` is exactly the managed set — including
 // `{}` for "admin saved no servers" (mirrors `hasManagedCodexMcpConfig`).
 func buildPerTaskOpenclawConfig(activePath string, exists bool, snapshotPath string, resolvedList []any, agentsFromRegistry bool, workDir string, managedMcp map[string]any, hasManagedMcp bool, gateway OpenclawGatewayPin) map[string]any {
 	agents := map[string]any{
@@ -574,8 +575,8 @@ func buildPerTaskOpenclawConfig(activePath string, exists bool, snapshotPath str
 	if hasManagedMcp {
 		// Always emit `mcp.servers` (even when empty) so the wrapper's intent
 		// — "admin manages this set" — is grep-able on disk and visible to
-		// OpenClaw's loader. The snapshot $include has already dropped the
-		// user's `mcp` block, so this becomes the only definition.
+		// OpenClaw's loader. The snapshot chain's reset stage has already
+		// replaced the user's `mcp` block, so this becomes the only definition.
 		servers := managedMcp
 		if servers == nil {
 			servers = map[string]any{}
@@ -992,7 +993,7 @@ func openclawResolvedMcpConfig(bin string, timeout time.Duration) (map[string]an
 	defer cancel()
 	out, err := openclawExec(ctx, bin, "config", "get", "mcp", "--json")
 	if err != nil {
-		if isOpenclawKeyMissing(err) {
+		if isOpenclawKeyMissingResult(out, err, "mcp") {
 			return nil, nil
 		}
 		return nil, annotateOpenclawJSONError(err, out)
@@ -1030,7 +1031,7 @@ func openclawResolvedAgentsList(bin string, timeout time.Duration) ([]any, bool,
 	defer cancel()
 	out, err := openclawExec(ctx, bin, "config", "get", "agents.list", "--json")
 	if err != nil {
-		if isOpenclawKeyMissingResult(out, err) {
+		if isOpenclawKeyMissingResult(out, err, "agents.list") {
 			// New schema: the config path is gone; the agents live in the
 			// sqlite registry. Resolve them via the subcommand instead.
 			list, rerr := openclawRegistryAgentsList(bin, timeout)
@@ -1244,20 +1245,36 @@ const openclawJSONErrorMaxRunes = 1024
 
 func openclawJSONErrorMessage(stdout string) (string, bool) {
 	var envelope struct {
-		Error string `json:"error"`
+		Error json.RawMessage `json:"error"`
 	}
-	if json.Unmarshal([]byte(strings.TrimSpace(stdout)), &envelope) != nil {
+	if json.Unmarshal([]byte(strings.TrimSpace(stdout)), &envelope) != nil || len(envelope.Error) == 0 {
 		return "", false
 	}
-	message := strings.Join(strings.Fields(envelope.Error), " ")
+	var message string
+	if err := json.Unmarshal(envelope.Error, &message); err != nil {
+		// OpenClaw 2026.8.1-beta.3 changed JSON failures from
+		// {"error":"message"} to
+		// {"ok":false,"error":{"type":"cli_error","message":"message"}}.
+		// Extract only the diagnostic field in either shape; sibling fields can
+		// still carry resolved configuration or secrets.
+		var detail struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(envelope.Error, &detail) != nil {
+			return "", false
+		}
+		message = detail.Message
+	}
+	message = strings.Join(strings.Fields(message), " ")
 	return message, message != ""
 }
 
 // annotateOpenclawJSONError restores diagnostics for JSON-mode commands whose
-// CLI errors are written to stdout. Only the envelope's `error` string is
-// included: sibling fields may contain resolved configuration or secrets. The
-// message is whitespace-normalized for single-line logs and rune-bounded to
-// keep persisted task errors finite while preserving valid UTF-8.
+// CLI errors are written to stdout. Only the envelope's diagnostic message is
+// included, whether `error` is a string or an object: sibling fields may
+// contain resolved configuration or secrets. The message is
+// whitespace-normalized for single-line logs and rune-bounded to keep persisted
+// task errors finite while preserving valid UTF-8.
 func annotateOpenclawJSONError(err error, stdout string) error {
 	if err == nil {
 		return nil
@@ -1273,29 +1290,116 @@ func annotateOpenclawJSONError(err error, stdout string) error {
 	return fmt.Errorf("%w (json error: %s)", err, message)
 }
 
-// isOpenclawKeyMissingResult recognizes the JSON error envelope observed in
-// OpenClaw 2026.7.2-beta.7 for `config get ... --json` failures. It first
-// preserves the historical stderr/error-text matching, then parses only the
-// explicit `error` field and requires it to name agents.list; broad historical
-// phrases such as "not set" cannot reclassify an unrelated structured error.
-// Cancellation and timeout keep their original meaning even if a child emitted
-// a partial missing-path envelope before it stopped.
-func isOpenclawKeyMissingResult(stdout string, err error) bool {
+// isOpenclawKeyMissingResult recognizes the machine-readable failures emitted
+// by `config get ... --json`. OpenClaw 2026.7.2-beta.7 used a string `error`
+// field, while 2026.8.1-beta.3 nests the message under `error.message` and uses
+// "valid but unset" / "unknown config path" for absent values. Historical
+// stderr/error-text matching remains supported. Structured messages must name
+// the path we asked for, so a missing credential or unrelated path cannot be
+// mistaken for an absent config key. Cancellation and timeout keep their
+// original meaning even if a child emitted a partial missing-path envelope
+// before it stopped.
+func isOpenclawKeyMissingResult(stdout string, err error, keyPath string) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	if isOpenclawKeyMissing(err) {
+	if openclawKeyMissingMessageForPath(err.Error(), keyPath) {
 		return true
 	}
 	message, ok := openclawJSONErrorMessage(stdout)
 	if !ok {
 		return false
 	}
-	return strings.Contains(strings.ToLower(message), "agents.list") &&
-		isOpenclawKeyMissingMessage(message)
+	return openclawKeyMissingMessageForPath(message, keyPath)
+}
+
+func openclawKeyMissingMessageForPath(message, keyPath string) bool {
+	message = strings.ToLower(strings.Join(strings.Fields(message), " "))
+	keyPath = strings.ToLower(strings.TrimSpace(keyPath))
+	if keyPath == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"no value at ",
+		"missing key: ",
+		"missing key ",
+		"path not found: ",
+		"config path is valid but unset: ",
+		"unknown config path: ",
+	} {
+		if openclawMessageNamesPathAfter(message, marker, keyPath) {
+			return true
+		}
+	}
+	if openclawMessageNamesPathBefore(message, keyPath, " is not set") ||
+		openclawMessageNamesPathBefore(message, keyPath, " not set") ||
+		strings.Contains(message, "config path "+keyPath+" not found") {
+		return true
+	}
+	// Some pre-2026.6 builds returned only "Path not found" after the
+	// command wrapper. Accept that exact bare diagnostic when the command names
+	// the expected key, but do not combine the command path with an unrelated
+	// "not set" message later in stderr.
+	return strings.Contains(message, "config get "+keyPath) &&
+		(strings.HasSuffix(message, ": path not found") ||
+			strings.Contains(message, ": path not found ("))
+}
+
+func openclawMessageNamesPathBefore(message, keyPath, suffix string) bool {
+	needle := keyPath + suffix
+	for offset := 0; offset < len(message); {
+		relative := strings.Index(message[offset:], needle)
+		if relative < 0 {
+			return false
+		}
+		idx := offset + relative
+		leftBoundary := idx == 0 || isOpenclawPathLeftBoundary(message[idx-1])
+		if leftBoundary && isOpenclawPathBoundary(message[idx+len(needle):]) {
+			return true
+		}
+		offset = idx + len(keyPath)
+	}
+	return false
+}
+
+func openclawMessageNamesPathAfter(message, marker, keyPath string) bool {
+	for search := message; ; {
+		idx := strings.Index(search, marker)
+		if idx < 0 {
+			return false
+		}
+		rest := search[idx+len(marker):]
+		if strings.HasPrefix(rest, keyPath) && isOpenclawPathBoundary(rest[len(keyPath):]) {
+			return true
+		}
+		search = rest
+	}
+}
+
+func isOpenclawPathLeftBoundary(char byte) bool {
+	switch char {
+	case ' ', '(', '[', '{', ',', ';', ':', '\'', '"', '`':
+		return true
+	default:
+		return false
+	}
+}
+
+func isOpenclawPathBoundary(rest string) bool {
+	if rest == "" {
+		return true
+	}
+	switch rest[0] {
+	case ' ', ')', ']', '}', ',', ';', ':', '\'', '"', '`':
+		return true
+	case '.':
+		return len(rest) == 1 || rest[1] == ' ' || rest[1] == ')' || rest[1] == ']'
+	default:
+		return false
+	}
 }
 
 func isOpenclawKeyMissingMessage(msg string) bool {

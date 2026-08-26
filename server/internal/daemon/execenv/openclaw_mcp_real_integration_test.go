@@ -3,10 +3,12 @@
 package execenv
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -16,10 +18,16 @@ import (
 //
 // The unit tests above assert the JSON this package writes. That is not enough
 // for a design whose correctness lives in OpenClaw's include-merge semantics —
-// `{"mcp": null}` resetting the user's block, and the resolved siblings being
-// restored after it. Only the real loader can confirm that, which is why this
-// test asks the CLI to resolve the chain we generated rather than inspecting our
-// own files.
+// ordered array includes, the nested wrapper-to-snapshot include, and
+// `{"mcp": null}` resetting the user's block before the managed set is merged.
+// Only the real loader can confirm that, which is why this test asks the CLI to
+// resolve the chain we generated rather than inspecting our own files.
+//
+// All three loader behaviors and the exact managed-server isolation were
+// measured locally on 2026-08-26 against the npm extended-stable (2026.6.34),
+// latest (2026.7.1-2), and beta (2026.8.1-beta.3) channels. The OpenClaw config
+// compatibility smoke workflow keeps those three moving channels under
+// scheduled and manually dispatched coverage.
 func realOpenclawBin(t *testing.T) string {
 	t.Helper()
 	if os.Getenv("MULTICA_RUN_REAL_AGENT_SMOKE") == "" {
@@ -34,7 +42,7 @@ func realOpenclawBin(t *testing.T) string {
 
 // realOpenclawConfig points the CLI at an isolated HOME holding a user config
 // with both a user-only MCP server (which must not survive the reset) and a
-// non-server MCP setting (which must).
+// same-name server whose definition the managed set must replace.
 func realOpenclawConfig(t *testing.T) (bin, activeConfig string) {
 	t.Helper()
 	bin = realOpenclawBin(t)
@@ -47,9 +55,12 @@ func realOpenclawConfig(t *testing.T) (bin, activeConfig string) {
 	activeConfig = filepath.Join(stateDir, "openclaw.json")
 	config := `{
 		"gateway": {"mode": "local"},
+		"logging": {"level": "debug"},
 		"mcp": {
-			"sessionIdleTtlMs": 300000,
-			"servers": {"user-only": {"command": "echo"}}
+			"servers": {
+				"user-only": {"command": "user-only"},
+				"shared": {"command": "user-shared"}
+			}
 		}
 	}`
 	if err := os.WriteFile(activeConfig, []byte(config), 0o600); err != nil {
@@ -63,6 +74,21 @@ func realOpenclawConfig(t *testing.T) (bin, activeConfig string) {
 	return bin, activeConfig
 }
 
+func realOpenclawConfigGetJSON(t *testing.T, bin, keyPath string) any {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), openclawCLITimeout)
+	defer cancel()
+	out, err := openclawExec(ctx, bin, "config", "get", keyPath, "--json")
+	if err != nil {
+		t.Fatalf("resolve %s through the real CLI: %v", keyPath, annotateOpenclawJSONError(err, out))
+	}
+	var value any
+	if err := json.Unmarshal([]byte(out), &value); err != nil {
+		t.Fatalf("parse resolved %s JSON %q: %v", keyPath, out, err)
+	}
+	return value
+}
+
 func TestPrepareOpenclawConfigRealCLI(t *testing.T) {
 	bin, activeConfig := realOpenclawConfig(t)
 
@@ -74,7 +100,10 @@ func TestPrepareOpenclawConfigRealCLI(t *testing.T) {
 
 	result, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{
 		OpenclawBin: bin,
-		McpConfig:   json.RawMessage(`{"mcpServers":{}}`),
+		McpConfig: json.RawMessage(`{"mcpServers":{
+			"managed-only":{"command":"managed-only"},
+			"shared":{"command":"managed-shared"}
+		}}`),
 	})
 	if err != nil {
 		t.Fatalf("prepareOpenclawConfig against the real CLI: %v", err)
@@ -94,15 +123,22 @@ func TestPrepareOpenclawConfigRealCLI(t *testing.T) {
 	// verifies the reset bridge rather than merely inspecting the JSON we wrote.
 	t.Setenv("OPENCLAW_CONFIG_PATH", result.ConfigPath)
 	t.Setenv("OPENCLAW_INCLUDE_ROOTS", result.IncludeRoot)
+	// This field exists only in the live user config. Seeing it through the
+	// generated wrapper proves the outer include followed the nested snapshot
+	// include rather than merely leaving the wrapper's managed MCP block intact.
+	if level := realOpenclawConfigGetJSON(t, bin, "logging.level"); level != "debug" {
+		t.Fatalf("resolved logging.level = %#v, want debug through nested includes", level)
+	}
 	resolvedMcp, err := openclawResolvedMcpConfig(bin, openclawCLITimeout)
 	if err != nil {
 		t.Fatalf("resolve the generated config with the real CLI: %v", err)
 	}
 	servers, ok := resolvedMcp["servers"].(map[string]any)
-	if !ok || len(servers) != 0 {
-		t.Fatalf("resolved managed servers = %#v, want empty and no user-only leak", resolvedMcp["servers"])
+	wantServers := map[string]any{
+		"managed-only": map[string]any{"command": "managed-only"},
+		"shared":       map[string]any{"command": "managed-shared"},
 	}
-	if resolvedMcp["sessionIdleTtlMs"] != float64(300000) {
-		t.Fatalf("resolved non-server MCP settings = %#v, want sessionIdleTtlMs preserved", resolvedMcp)
+	if !ok || !reflect.DeepEqual(servers, wantServers) {
+		t.Fatalf("resolved managed servers = %#v, want exactly %#v", resolvedMcp["servers"], wantServers)
 	}
 }
