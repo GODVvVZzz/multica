@@ -16,6 +16,7 @@ import { api, dispatchReasonCode } from "@multica/core/api";
 import {
   isAgentRuntimeBound as hasAgentRuntime,
   useAgentPresenceDetail,
+  useCustomizeStarterPromptsHref,
   useWorkspaceAgentAvailability,
 } from "@multica/core/agents";
 import {
@@ -277,6 +278,25 @@ export function useChatController(opts?: { isActive?: boolean }) {
     () => setFocusInputRequest((n) => n + 1),
     [],
   );
+  const [starterPromptRequest, setStarterPromptRequest] = useState<{
+    id: number;
+    content: string;
+  } | null>(null);
+  const nextStarterPromptRequestIdRef = useRef(0);
+  const prefillStarterPrompt = useCallback(
+    (prompt: string) => {
+      setStarterPromptRequest({
+        id: ++nextStarterPromptRequestIdRef.current,
+        content: prompt,
+      });
+      requestInputFocus();
+    },
+    [requestInputFocus],
+  );
+  const handleStarterPromptApplied = useCallback(
+    () => setStarterPromptRequest(null),
+    [],
+  );
 
   const currentSession = activeSessionId
     ? sessions.find((s) => s.id === activeSessionId)
@@ -350,6 +370,14 @@ export function useChatController(opts?: { isActive?: boolean }) {
   // (MUL-6380). Same rule the server enforces, via the shared predicate.
   const isAgentAccessRevoked =
     !!activeAgent && !canAssignAgent(activeAgent, user?.id, memberRole);
+
+  // "Customize" under the starter buttons in the empty state — the only place
+  // that admits those buttons are configuration. Resolved here so the full
+  // page and the floating window cannot disagree about who sees it.
+  const customizeStarterPromptsHref = useCustomizeStarterPromptsHref(
+    activeAgent,
+    wsId,
+  );
 
   const agentAvailability = useWorkspaceAgentAvailability();
   const noAgent = agentAvailability === "none";
@@ -815,6 +843,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
     isAgentAccessRevoked,
     isAgentRuntimeBound,
     activeAgent,
+    customizeStarterPromptsHref,
     noAgent,
     availability,
     // messages
@@ -832,6 +861,9 @@ export function useChatController(opts?: { isActive?: boolean }) {
     handleRestoreDraftApplied,
     // compose-box focus nonce (bumped on new chat)
     focusInputRequest,
+    starterPromptRequest,
+    handleStarterPromptApplied,
+    prefillStarterPrompt,
     // actions
     handleSend,
     handleStop,

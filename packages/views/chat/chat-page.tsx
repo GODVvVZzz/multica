@@ -283,7 +283,12 @@ export function ChatPage() {
           quickActionsPendingMessageId={quickActionsPending?.message_id ?? null}
         />
       ) : (
-        <EmptyState agent={c.activeAgent} />
+        <EmptyState
+          agent={c.activeAgent}
+          hasSessions={c.sessions.length > 0}
+          onPickPrompt={c.prefillStarterPrompt}
+          customizeHref={c.customizeStarterPromptsHref}
+        />
       )}
 
       {c.isAgentAccessRevoked ? (
@@ -314,6 +319,8 @@ export function ChatPage() {
       <ChatInput
         onSend={c.handleSend}
         restoreDraftRequest={c.restoreDraftRequest}
+        starterPromptRequest={c.starterPromptRequest}
+        onStarterPromptApplied={c.handleStarterPromptApplied}
         onRestoreDraftApplied={c.handleRestoreDraftApplied}
         uploadEnabled={c.uploadEnabled && !c.isAgentAccessRevoked}
         onStop={c.handleStop}
