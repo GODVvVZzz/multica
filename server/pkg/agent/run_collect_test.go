@@ -79,7 +79,7 @@ func TestCheckOpenclawVersionReapsPipeHoldingGrandchild(t *testing.T) {
 }
 
 // TestCheckOpenclawVersionAcceptsStderrOnlyVersion — the gate replaced
-// cmd.CombinedOutput(), so stderr has to stay in the parse. A build that prints
+// combinedOutputOwned, so stderr has to stay in the parse. A build that prints
 // its banner there would otherwise fail the minimum-version check with an empty
 // output, which skips the runtime entirely.
 func TestCheckOpenclawVersionAcceptsStderrOnlyVersion(t *testing.T) {
@@ -140,8 +140,10 @@ func waitForProcessGone(pid int, within time.Duration) bool {
 }
 
 // TestRunCollectReturnsDespitePipeHoldingGrandchild pins guarantee #1: the call
-// completes even though a helper still holds stdout. With cmd.Output() this
-// blocked until the helper's `sleep 300` finished.
+// completes even though a helper still holds stdout. With any buffer-based form —
+// cmd.Output(), or launch.go's outputOwned — this blocks until the helper's
+// `sleep 300` finishes, or until probeWaitDelay converts it into
+// exec.ErrWaitDelay.
 func TestRunCollectReturnsDespitePipeHoldingGrandchild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "helper.pid")
 	cli := writeForkingCLI(t, pidFile)

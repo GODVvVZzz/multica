@@ -97,14 +97,22 @@ func (o *outputBuffer) idleFor() (time.Duration, bool) {
 // collector runs a command with pipes this package owns, rather than handing
 // os/exec an io.Writer and letting it do the draining.
 //
-// That distinction is the whole point. When os/exec owns the draining, Wait
-// blocks until the output pipes reach EOF, and EOF requires every write end to
-// be closed — so a CLI that forks a helper inheriting stdout (OpenClaw spawns
-// `openclaw-config`) keeps Wait open for the helper's lifetime. Cancelling the
-// context does not help: it kills the direct child without unblocking os/exec's
-// io.Copy. Handing os/exec an *os.File instead means it starts no copy goroutine
-// at all, so Wait returns the instant the direct child exits and this package
-// decides when reading is over.
+// That distinction is the whole point, and it is the one thing launch.go's
+// runOwned / outputOwned / combinedOutputOwned cannot do. When os/exec owns the
+// draining, Wait blocks until the output pipes reach EOF, and EOF requires every
+// write end to be closed — so a CLI that forks a helper inheriting stdout
+// (OpenClaw spawns `openclaw-config`) keeps Wait open for the helper's lifetime.
+// Cancelling the context does not help: it kills the direct child without
+// unblocking os/exec's io.Copy. Handing os/exec an *os.File instead means it
+// starts no copy goroutine at all, so Wait returns the instant the direct child
+// exits and this package decides when reading is over.
+//
+// The owned helpers bound that wait with probeWaitDelay instead, which is the
+// right trade for the probes they serve — but the bound expires into
+// exec.ErrWaitDelay, so a CLI whose answer arrived and whose helper lingered is
+// reported as a failed call. On the OpenClaw paths that is not tolerable: a
+// failed `--version` skips runtime registration, and a failed `config file`
+// fails task preparation. See RunCollect for the rest of that comparison.
 type collector struct {
 	cmd        *exec.Cmd
 	outR, errR *os.File
@@ -286,9 +294,20 @@ func (c *collector) exitErr() (error, bool) {
 }
 
 // RunCollect runs a short-lived CLI command to completion and returns its
-// stdout and stderr. It is the safe replacement for cmd.Output() on any path
-// that shells out to an agent CLI — see collector for why cmd.Output() cannot
-// be bounded when the CLI leaves a descendant holding stdout.
+// stdout and stderr. It is the strongest of the three ways this package runs a
+// one-shot CLI, and the one to reach for when the answer must survive a CLI that
+// leaves a descendant holding stdout — see collector for why os/exec cannot be
+// bounded on that shape without also failing the call.
+//
+// Against launch.go's outputOwned, which is what every other probe in this
+// package uses: both own the process tree, both kill it after the reap. The
+// difference is who owns the pipes. outputOwned hands os/exec a bytes.Buffer, so
+// Wait waits on pipe EOF and is bounded by probeWaitDelay, which expires into
+// exec.ErrWaitDelay — the answer is in the buffer and the call reports failure.
+// That is the right default for a probe whose CLI exits: it is a smaller
+// mechanism and it preserves the stdlib's contract exactly. It is the wrong one
+// where a lingering descendant is the normal case rather than the broken one,
+// which on the OpenClaw paths it measurably is.
 //
 // #6084 measured that shape (a shim whose backgrounded child slept 6s took
 // 6.01s against a 150ms deadline) and reverted a cmd.WaitDelay backstop on
@@ -320,10 +339,10 @@ func (c *collector) exitErr() (error, bool) {
 // (`--version`, `agents list`, `config get`).
 //
 // This path-taking form has no production caller yet — the three call sites this
-// change converts already hold a *exec.Cmd and use RunCollectCmd. It is the
-// entry point for the remaining cmd.Output() call sites in this package
-// (models.go's catalog probes, codex.go, deveco_models.go, thinking.go), which
-// carry the same shape and are deliberately out of scope here.
+// change converts already hold a *exec.Cmd and use RunCollectCmd. It exists for
+// a caller that only has a path, and as the entry point should another probe turn
+// out to need pipe ownership rather than the probeWaitDelay bound outputOwned
+// gives it (#7531 moved the rest of this package's one-shot probes onto that).
 func RunCollect(ctx context.Context, env []string, execPath string, args ...string) (stdout []byte, stderr string, err error) {
 	// Command.exec, not exec.CommandContext: launch.go owns process construction
 	// so a custom runtime's fixed_args prefix cannot be dropped (GH #7046). A zero

@@ -658,9 +658,11 @@ jobs:
         run: go test ./pkg/agent -v -run '^(TestStartOwnedProcessTreeCapturesImmediateDescendants|TestStartOwnedProcessTreeLeavesNoSuspendedChild|TestWaitProcessGroupGoneWithoutOwnershipReportsUnconfirmed|TestCodexInitializeRetrySupportedWithOwnedProcessTree|TestCodexWindowsDescendantsDieWithTheOwnedProcessTree)$' -count=1 -timeout=5m
 
       - name: Test bounded CLI output collection on Windows
+        if: ${{ needs.changes.outputs.backend == 'true' }}
         working-directory: server
-        # MUL-5467: RunCollect / RunCollectQuiet replace cmd.Output() on the
-        # OpenClaw CLI paths. A real Windows host proves its Job Object owns and
+        # MUL-5467: RunCollect / RunCollectQuiet own the pipes as well as the
+        # process tree on the OpenClaw CLI paths, which outputOwned cannot. A real
+        # Windows host proves its Job Object owns and
         # terminates descendants, a CLI that prints its answer and then refuses
         # to exit still yields that answer, a response still streaming at the
         # deadline is NOT reported as success, and no collector goroutine
