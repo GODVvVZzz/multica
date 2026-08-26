@@ -828,7 +828,11 @@ func openclawTildeRest(path string) (string, bool) {
 // `src/cli/config-cli.ts`'s `runConfigFile` prints `shortenHomePath(...)`, and
 // `src/utils.ts:147-157` uses the `$OPENCLAW_HOME` prefix whenever that variable
 // is non-empty and `~` otherwise — so setting the variable is what selects this
-// form.
+// form. Still true at `v2026.7.1`: `runConfigFile` is unchanged, and
+// `resolveHomeDisplayPrefix` there returns `$OPENCLAW_HOME` on a non-empty
+// trimmed `OPENCLAW_HOME` and `~` otherwise, with the separator coming from the
+// original path rather than being inserted — which is why the rest is sliced
+// after the prefix here rather than trimmed of a leading separator.
 //
 // Only the bare spelling is emitted by that code path. `${OPENCLAW_HOME}` is
 // accepted as defense against a release that spells it the other way, not

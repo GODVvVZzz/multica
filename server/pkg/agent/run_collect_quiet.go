@@ -67,6 +67,16 @@ func JSONOutputComplete(stdout []byte) bool {
 // contract of those commands is "print a value"; once the value has arrived,
 // whether the process tidies itself up is not the caller's business.
 //
+// Nor is that a quirk of the build those timings came from. Upstream has an
+// explicit opt-in for "print a one-shot answer and then exit" —
+// `requestExitAfterOneShotOutput`, flushed at the end of `runCli` after both
+// streams drain (`src/cli/one-shot-exit.ts`, checked at `v2026.7.1`). In the
+// shipped 2026.7.1 build only `models list`, `models status` and the hooks CLI
+// take it. `config file`, `config get` and `agents list` do not: their success
+// paths only print, so termination is whatever the Node event loop happens to
+// do, and `runtime.exit` appears on their failure paths alone. So a version
+// where they exit promptly is not making a promise a later one has to keep.
+//
 // # Why `complete` is required rather than "any output"
 //
 // An earlier revision returned success from the deadline branch whenever stdout
