@@ -24,10 +24,20 @@ import (
 // resolve the chain we generated rather than inspecting our own files.
 //
 // All three loader behaviors and the exact managed-server isolation were
-// measured locally on 2026-08-26 against the npm extended-stable (2026.6.34),
-// latest (2026.7.1-2), and beta (2026.8.1-beta.3) channels. The OpenClaw config
-// compatibility smoke workflow keeps those three moving channels under
-// scheduled and manually dispatched coverage.
+// measured on 2026-08-26 on Windows 10.0.19045.6466 (PowerShell 7.6.4, Go
+// 1.26.6 windows/amd64) against the npm extended-stable (2026.6.34), latest
+// (2026.7.1-2), and beta (2026.8.1-beta.3) channels: PASS in 36.9s, 40.6s and
+// 34.2s respectively. Windows on purpose — that is the platform where the npm
+// shim puts `cmd.exe → node → node` between the daemon and the CLI, so it is the
+// least forgiving place to assert include resolution.
+//
+// The control that makes those passes mean something was run by hand rather than
+// asserted here: dropping the reset stage from the chain leaks `user-only` back
+// into the resolved server map on all three channels. Without that, a green test
+// could equally mean "the wrapper's own block happened to win".
+//
+// The OpenClaw config compatibility smoke workflow keeps those three moving
+// channels under scheduled and manually dispatched coverage.
 func realOpenclawBin(t *testing.T) string {
 	t.Helper()
 	if os.Getenv("MULTICA_RUN_REAL_AGENT_SMOKE") == "" {

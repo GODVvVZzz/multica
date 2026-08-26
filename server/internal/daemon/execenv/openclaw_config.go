@@ -371,19 +371,34 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 	// config via `$include` would let user-only entries leak in (and an empty
 	// managed set would not actually clear inherited servers).
 	//
-	// The resolved-root form this used to use (`config get --json` with no path)
-	// is not reliably answered: measured against 2026.5.27 it writes zero bytes
-	// to stdout and never exits, which fails preparation for every managed-MCP
-	// task on such a host. Scoped to that measurement deliberately — the field
-	// reports on 2026.7.1-2 are about `config file`, not this read, so the root
-	// read's behaviour there is unmeasured. `config get mcp --json` is answered,
-	// and is also the only part this code needs, so ask for the subtree and build
-	// a three-stage include:
+	// The resolved-root form this used to use — `config get --json` with no key
+	// path — is not a valid invocation. `config get` requires a path, and every
+	// channel measured on 2026-08-26 rejects the pathless form outright:
+	//
+	//	2026.6.34   (extended-stable)  exit 1 in 2.9s, `Missing required argument "path".`
+	//	2026.7.1-2  (latest)           exit 1 in 3.0s, same message
+	//	2026.8.1-beta.3 (beta)         exit 1 in 4.4s, same message as a JSON envelope
+	//
+	// So the old read did not degrade on some hosts; it failed preparation for
+	// every managed-MCP task on all three current channels, with a usage error.
+	// (2026.5.27 instead wrote zero bytes and never exited within 60s. That is
+	// one version behaving differently from every current one, and the fix does
+	// not depend on which of the two shapes a given host produces.)
+	//
+	// `config get mcp --json` is answered, and the subtree is the only part of
+	// the configuration this code needs, so ask for it and build a three-stage
+	// include:
 	//
 	//  1. include the user's full config,
 	//  2. merge `mcp: null` to replace its MCP object wholesale,
-	//  3. restore the resolved non-server MCP settings (`sessionIdleTtlMs` and
-	//     friends).
+	//  3. restore the resolved non-server MCP settings (`mcp.apps` on
+	//     2026.8.1-beta.3, whose `mcp` schema is exactly `servers` + `apps` with
+	//     additionalProperties:false; `sessionIdleTtlMs` on channels that still
+	//     accept it).
+	//
+	// Stage 3 can only carry keys the same CLI just returned, which is what
+	// keeps it safe against that additionalProperties:false — this code never
+	// invents a key the loader would then reject.
 	//
 	// The wrapper then adds the managed server set, which becomes the only MCP
 	// server definition the snapshot can yield, while the user's surrounding
@@ -974,20 +989,24 @@ func isOpenclawConfigFileUnsupported(err error) bool {
 // openclawResolvedMcpConfig fetches the user's resolved `mcp` subtree via
 // `openclaw config get mcp --json`. The CLI's loader handles JSON5 / $include /
 // env-substitution, so this is the user's effective MCP settings with the
-// sibling tuning (`sessionIdleTtlMs` and friends) the wrapper has to preserve.
+// sibling tuning the wrapper has to preserve — `mcp.apps` on 2026.8.1-beta.3,
+// `sessionIdleTtlMs` on channels that still accept it.
 //
-// The subtree rather than the root: `config get --json` with no key path was
-// measured against 2026.5.27 writing nothing to stdout and never exiting, which
-// makes reading the root a preparation timeout for every managed-MCP task on
-// such a host. That is one release on one host and is not generalized here: the
-// field reports on 2026.7.1-2 (#6275, #7308) both concern `config file`, so what
-// the root read does on that version is unmeasured. The subtree is the right
-// target regardless — it is the only part of the configuration this code needs,
-// which also keeps the user's API keys and provider tokens out of this process
-// entirely.
+// The subtree rather than the root because the root form is not a valid
+// invocation: `config get` requires a path. Measured 2026-08-26, the pathless
+// form is rejected on every current channel — 2026.6.34, 2026.7.1-2 and
+// 2026.8.1-beta.3 all exit 1 within 3-5s with `Missing required argument
+// "path".` (2026.5.27 instead wrote nothing and never exited within 60s.) Either
+// way the old root read could not produce a resolved config, so the subtree is
+// not a workaround for a hang — it is the request this code should have been
+// making. It is also the only part of the configuration needed here, which keeps
+// the user's API keys and provider tokens out of this process entirely.
 //
-// A missing key is not an error: a config with no `mcp` block at all answers
-// "path not found", which means there is nothing to preserve.
+// A missing key is not an error: a config with no `mcp` block answers "path not
+// found" (2026.6.34, 2026.7.1-2) or "config path is valid but unset"
+// (2026.8.1-beta.3), which both mean there is nothing to preserve. A *usage*
+// error is not that, and isOpenclawKeyMissingResult keeps them apart by
+// requiring the diagnostic to name the path we asked for.
 func openclawResolvedMcpConfig(bin string, timeout time.Duration) (map[string]any, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -1290,15 +1309,28 @@ func annotateOpenclawJSONError(err error, stdout string) error {
 	return fmt.Errorf("%w (json error: %s)", err, message)
 }
 
-// isOpenclawKeyMissingResult recognizes the machine-readable failures emitted
-// by `config get ... --json`. OpenClaw 2026.7.2-beta.7 used a string `error`
-// field, while 2026.8.1-beta.3 nests the message under `error.message` and uses
-// "valid but unset" / "unknown config path" for absent values. Historical
-// stderr/error-text matching remains supported. Structured messages must name
-// the path we asked for, so a missing credential or unrelated path cannot be
-// mistaken for an absent config key. Cancellation and timeout keep their
-// original meaning even if a child emitted a partial missing-path envelope
-// before it stopped.
+// isOpenclawKeyMissingResult recognizes the "you asked for a key that is not
+// there" failures of `config get ... --json`. Which channel reports it where was
+// measured on 2026-08-26, and the spread is why both transports stay supported:
+//
+//	2026.6.34   (extended-stable)  stderr text, stdout empty
+//	2026.7.1-2  (latest)           stderr text, stdout empty
+//	2026.7.2-beta.7                stdout {"error":"..."}
+//	2026.8.1-beta.3 (beta)         stdout {"ok":false,"error":{"message":...}}
+//
+// So the stdout envelope is not "the new way" that replaced stderr — the current
+// stable and latest channels are stderr-only, and only the beta line puts it on
+// stdout. Dropping either transport breaks a channel that is shipping today.
+//
+// Wording also moved: 2026.6.34 and 2026.7.1-2 say "Config path not found: mcp",
+// 2026.8.1-beta.3 says "Config path is valid but unset: mcp" for a key the schema
+// knows and "Unknown config path: agents.list" for one it does not.
+//
+// Structured messages must name the path we asked for. That is what keeps a
+// *usage* error out of this branch: the pathless `config get --json` form fails
+// with `Missing required argument "path".`, which names no path and so cannot be
+// read as an absent key. Cancellation and timeout keep their original meaning
+// even if a child emitted a partial missing-path envelope before it stopped.
 func isOpenclawKeyMissingResult(stdout string, err error, keyPath string) bool {
 	if err == nil {
 		return false

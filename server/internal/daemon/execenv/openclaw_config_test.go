@@ -1774,6 +1774,35 @@ func TestIsOpenclawKeyMissingResult(t *testing.T) {
 			path:   "mcp",
 			want:   false,
 		},
+		// Measured 2026-08-26. `config get` requires a path, so the pathless form
+		// the old resolved-root read used is rejected as a usage error on every
+		// current channel. It names no path, and must not be read as "the key is
+		// absent" — that would turn a broken invocation into a silent "user has no
+		// mcp block" and hand the task a wrapper built on a false premise.
+		{
+			name: "2026.6.34 / 2026.7.1-2 pathless usage error is not a missing key",
+			err:  errors.New(`openclaw config get --json: exit status 1 (stderr: Missing required argument "path". Try: openclaw config get --help)`),
+			path: "mcp",
+			want: false,
+		},
+		{
+			name:   "2026.8.1-beta.3 pathless usage envelope is not a missing key",
+			stdout: `{"ok":false,"error":{"type":"cli_error","message":"Missing required argument \"path\".\nTry: openclaw config get --help"}}`,
+			err:    errors.New("exit status 1"),
+			path:   "mcp",
+			want:   false,
+		},
+		// Also measured: beta.3 reports a schema violation through the same
+		// envelope, with the offending key in a sibling `issues` array. An invalid
+		// config is the opposite of an absent key — treating it as absent would
+		// proceed with a config the loader has already refused.
+		{
+			name:   "2026.8.1-beta.3 invalid-config envelope is not a missing key",
+			stdout: `{"ok":false,"error":{"type":"cli_error","message":"OpenClaw config is invalid: wrapper.json"},"issues":[{"path":"mcp","message":"Unrecognized key: \"sessionIdleTtlMs\""}]}`,
+			err:    errors.New("exit status 1"),
+			path:   "mcp",
+			want:   false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

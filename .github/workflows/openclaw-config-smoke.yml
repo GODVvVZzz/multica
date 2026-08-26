@@ -51,8 +51,26 @@ jobs:
       - name: Record resolved OpenClaw version
         run: openclaw --version
 
+      # A skipped Go test reports `ok` at the package level, so without this the
+      # job goes green whenever the CLI is absent, MULTICA_RUN_REAL_AGENT_SMOKE
+      # is unset, or the -run pattern stops matching — i.e. exactly when the
+      # thing being verified is not being verified. #6897's Windows step calls
+      # out the same hazard for the same reason. Require the RUN/PASS line and
+      # reject SKIP explicitly rather than trusting the exit status.
       - name: Verify managed MCP isolation through the real loader
         working-directory: server
         env:
           MULTICA_RUN_REAL_AGENT_SMOKE: "1"
-        run: go test -tags agentintegration ./internal/daemon/execenv/ -run '^TestPrepareOpenclawConfigRealCLI$' -count=1 -v
+        run: |
+          set -o pipefail
+          go test -tags agentintegration ./internal/daemon/execenv/ \
+            -run '^TestPrepareOpenclawConfigRealCLI$' -count=1 -v \
+            2>&1 | tee smoke.log
+          if grep -q -- '--- SKIP: TestPrepareOpenclawConfigRealCLI' smoke.log; then
+            echo "::error::the real-loader test skipped; nothing was verified for ${{ matrix.channel }}"
+            exit 1
+          fi
+          if ! grep -q -- '--- PASS: TestPrepareOpenclawConfigRealCLI' smoke.log; then
+            echo "::error::no PASS line for the real-loader test on ${{ matrix.channel }}"
+            exit 1
+          fi
