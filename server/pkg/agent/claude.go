@@ -74,17 +74,8 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
 	hideAgentWindow(cmd)
-	// Run claude in its own process group so cancellation can reach the whole
-	// tree — the claude CLI plus the MCP servers and tool subprocesses it
-	// spawns — not just the direct child. The default CommandContext behaviour
-	// SIGKILLs only the leader, which orphans those descendants; on a resumed
-	// stream-json session with no wall-clock timeout they then keep running and
-	// burning model budget long after the task was cancelled, and under
-	// --max-concurrent-tasks 1 starve every queued task (#5918). This mirrors
-	// the fix already made for codex (#4520) and opencode (#4533).
-	configureProcessGroup(cmd)
-	// Take over context cancellation: the default would SIGKILL only the leader
-	// the instant runCtx is done. We instead drive a graceful group-wide
+	// Take over context cancellation: the default kills the whole group the
+	// instant runCtx is done. We instead drive a graceful group-wide
 	// SIGTERM→SIGKILL from the cancellation goroutine below and close stdout
 	// only after the tree has been signalled. Returning nil keeps os/exec from
 	// racing us with its own kill; WaitDelay remains the hard backstop.
@@ -120,7 +111,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "[claude:stderr] "), agentStderrTailBytes)
 	cmd.Stderr = stderrBuf
 
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		closeStdin()
 		cancel()
 		return nil, fmt.Errorf("start claude: %w", err)
@@ -128,7 +119,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	b.cfg.Logger.Info("claude started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
 
-	// cmd.Start() succeeded — transfer temp file ownership to the goroutine.
+	// The process started — transfer temp file ownership to the goroutine.
 	mcpFileCleanup = nil
 
 	msgCh := make(chan Message, 256)
@@ -284,6 +275,10 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// Wait for process exit, then release the cancellation handler.
 		exitErr := cmd.Wait()
 		close(procDone)
+		// The leader is reaped; drop ownership. On Windows that closes the Job
+		// Object, which kills anything still inside it — precisely what should
+		// happen to a descendant that outlived the CLI (GH #7522).
+		releaseProcessGroup(cmd)
 		duration := time.Since(startTime)
 		// writeDone is buffered (cap 1) and the writer always sends — by the
 		// time cmd has exited, the prompt write has either succeeded, hit a
@@ -1110,15 +1105,24 @@ func detectCLIVersion(ctx context.Context, runtimeCmd Command) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, detectVersionTimeout)
 	defer cancel()
 
-	// RunCollectCmd, not cmd.Output(): a broken CLI (node/bun shim) can leave
-	// grandchildren that inherited and still hold our stdout pipe open, and
-	// cmd.Output() blocks in Wait() until that pipe closes — defeating the
-	// timeout above. The collector owns the pipes so Wait returns on the direct
-	// child's exit, then reaps the tree so the grandchild cannot linger as an
-	// orphan. The cmd.WaitDelay backstop this replaces bounded the call but left
-	// that orphan running and reported exec.ErrWaitDelay, i.e. it failed a probe
-	// whose output had in fact arrived — and a failed version probe skips runtime
-	// registration entirely. See run_collect.go and MUL-5467.
+	// RunCollectCmd, not outputOwned: a broken CLI (node/bun shim) can leave
+	// grandchildren that inherited and still hold our stdout pipe open. Both
+	// helpers own the process tree, but outputOwned hands os/exec a
+	// bytes.Buffer, so os/exec owns the copy goroutines and Wait blocks until
+	// the pipes reach EOF — which the grandchild controls, not us. It bounds
+	// that with probeWaitDelay (2s, the same backstop this call used to set by
+	// hand), and a bounded Wait returns exec.ErrWaitDelay: the version is
+	// already in the buffer and the probe reports failure anyway. On this path
+	// that is the expensive kind of wrong, because a failed --version skips
+	// runtime registration entirely.
+	//
+	// The collector owns the pipes as *os.File instead, so os/exec starts no
+	// copy goroutine, Wait returns on the direct child's exit whatever a
+	// descendant is holding, and the real exit status is what gets reported.
+	// The tree is then reaped, so the grandchild does not linger as an orphan —
+	// runOwned's post-Wait group kill does that much already; what is new here
+	// is not paying for it with a false failure. See run_collect.go and
+	// MUL-5467.
 	//
 	// Built through runtimeCmd.exec so a custom runtime's fixed_args prefix is
 	// still applied (MUL-6260); the collector is handed the finished command.

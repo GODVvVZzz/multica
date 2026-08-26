@@ -110,7 +110,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	cmd.Stderr = newLogWriter(b.cfg.Logger, "[openclaw:stderr] ")
 
-	if err := cmd.Start(); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start openclaw: %w", err)
 	}
@@ -148,6 +148,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 		// Wait for process exit.
 		exitErr := cmd.Wait()
+		releaseProcessGroup(cmd)
 		duration := time.Since(startTime)
 
 		switch {
@@ -297,11 +298,17 @@ func checkOpenclawVersion(ctx context.Context, runtimeCmd Command) error {
 
 	// RunCollectCmd for the reason recorded on openclawCLITimeout: it owns the
 	// pipes, so Wait returns on the direct child's exit whatever a descendant is
-	// holding, and it reaps the tree instead of orphaning it.
+	// holding. combinedOutputOwned reaps the tree too, but through os/exec's own
+	// copy goroutines, so `openclaw --version` leaving its config helper on the
+	// pipe costs probeWaitDelay and then reports exec.ErrWaitDelay — failing the
+	// gate, and with it the task, on a version string already in the buffer.
 	//
 	// Both streams are parsed, and extractVersionLine is deliberately bypassed.
-	// This replaced cmd.CombinedOutput(), and dropping stderr would fail the
-	// gate outright on a build that prints its version there. parseOpenclawVersion
+	// This replaced combinedOutputOwned (cmd.CombinedOutput() before that), and
+	// dropping stderr would fail the gate outright on a build that prints its
+	// version there. Two buffers rather than one shared writer costs the
+	// stdlib's single interleaving, which nothing here reads: the two are
+	// concatenated below and scanned as one text. parseOpenclawVersion
 	// already scans the whole text with openclaw's own version pattern, whereas
 	// picking "the first line containing a semver" first would let unrelated
 	// stderr noise answer for it — a node deprecation warning carries one.

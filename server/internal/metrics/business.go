@@ -47,8 +47,9 @@ type BusinessMetrics struct {
 	entitlementRefresh                *prometheus.CounterVec
 	entitlementRefreshDuration        *prometheus.HistogramVec
 	entitlementDecision               *prometheus.CounterVec
-	entitlementVersionRegression      *prometheus.CounterVec
+	entitlementVersionRegression      prometheus.Counter
 	autopilotQuotaDecision            *prometheus.CounterVec
+	issueWindowDecision               *prometheus.CounterVec
 
 	activeMu    sync.Mutex
 	activeTasks map[string]activeTaskLabels
@@ -206,7 +207,7 @@ func NewBusinessMetrics() *BusinessMetrics {
 		}),
 		entitlementConfigError: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "entitlement", Name: "config_error_total",
-			Help: "Total startup failures caused by explicitly enabled but invalid entitlement policy configuration.",
+			Help: "Total startup failures caused by a malformed Multica Cloud URL for entitlement policy.",
 		}),
 		entitlementCache: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "entitlement", Name: "cache_total",
@@ -224,14 +225,18 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Namespace: "multica", Subsystem: "entitlement", Name: "decision_total",
 			Help: "Total entitlement decisions by bounded gate, action, and reason.",
 		}, metricLabels("multica_entitlement_decision_total")),
-		entitlementVersionRegression: prometheus.NewCounterVec(prometheus.CounterOpts{
+		entitlementVersionRegression: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "entitlement", Name: "version_regression_total",
-			Help: "Total rejected entitlement version regressions.",
-		}, metricLabels("multica_entitlement_version_regression_total")),
+			Help: "Total rejected entitlement subscription-version regressions.",
+		}),
 		autopilotQuotaDecision: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "autopilot_quota", Name: "decision_total",
 			Help: "Total autopilot quota admission outcomes.",
 		}, metricLabels("multica_autopilot_quota_decision_total")),
+		issueWindowDecision: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica", Subsystem: "issue_window", Name: "decision_total",
+			Help: "Total recently-created issue window outcomes by request surface.",
+		}, metricLabels("multica_issue_window_decision_total")),
 		activeTasks: map[string]activeTaskLabels{},
 		events:      newBusinessEventMetrics(),
 	}
@@ -271,6 +276,7 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.entitlementDecision,
 		m.entitlementVersionRegression,
 		m.autopilotQuotaDecision,
+		m.issueWindowDecision,
 	}, m.events.collectors()...)
 }
 
@@ -300,9 +306,9 @@ func (m *BusinessMetrics) RecordEntitlementDecision(gate, action, reason string)
 	}
 }
 
-func (m *BusinessMetrics) RecordEntitlementVersionRegression(source string) {
+func (m *BusinessMetrics) RecordEntitlementVersionRegression() {
 	if m != nil {
-		m.entitlementVersionRegression.WithLabelValues(source).Inc()
+		m.entitlementVersionRegression.Inc()
 	}
 }
 
@@ -316,6 +322,18 @@ func (m *BusinessMetrics) RecordAutopilotQuotaDecision(action, source, result st
 		source = "other"
 	}
 	m.autopilotQuotaDecision.WithLabelValues(action, source, result).Inc()
+}
+
+func (m *BusinessMetrics) RecordIssueWindowDecision(action, surface, result string) {
+	if m == nil {
+		return
+	}
+	switch surface {
+	case "direct", "list", "search", "grouped", "table", "children", "plugin", "inbox", "agent_context":
+	default:
+		surface = "other"
+	}
+	m.issueWindowDecision.WithLabelValues(action, surface, result).Inc()
 }
 
 func (m *BusinessMetrics) RecordRuntimeGCDeleted() {
