@@ -3,8 +3,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -251,4 +254,175 @@ func TestCollectedStdoutOverflowIsReportedNotTruncated(t *testing.T) {
 	if !errors.Is(err, errCollectStdoutTooLarge) {
 		t.Errorf("err = %v, want errCollectStdoutTooLarge", err)
 	}
+}
+
+// TestCollectedStdoutBoundaryIsExact pins where that cap falls, because it is a
+// compatibility boundary and not only a memory bound: a legal answer one byte
+// too large stops a task from starting. Off-by-one here would move the boundary
+// without anyone noticing.
+//
+// The limit is shrunk rather than fed 8 MiB, for the same reason
+// detectVersionTimeout is a var: the property under test is the comparison, not
+// the constant.
+func TestCollectedStdoutBoundaryIsExact(t *testing.T) {
+	prev := collectStdoutLimit
+	collectStdoutLimit = 8 << 10
+	t.Cleanup(func() { collectStdoutLimit = prev })
+
+	catBin, lookErr := exec.LookPath("cat")
+	if lookErr != nil {
+		t.Skipf("no cat binary to emit an exact byte count: %v", lookErr)
+	}
+
+	cases := []struct {
+		name       string
+		size       int
+		wantErrIs  error
+		wantOutLen int
+	}{
+		{name: "exactly at the limit", size: collectStdoutLimit, wantOutLen: collectStdoutLimit},
+		{name: "one byte past the limit", size: collectStdoutLimit + 1, wantErrIs: errCollectStdoutTooLarge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// A file rather than a shell loop, so the byte count is exact — no
+			// trailing newline a printf would add.
+			payload := filepath.Join(dir, "payload")
+			if err := os.WriteFile(payload, bytes.Repeat([]byte("z"), tc.size), 0o600); err != nil {
+				t.Fatalf("write payload: %v", err)
+			}
+			bin := filepath.Join(dir, "fake-cli")
+			if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+catBin+" "+payload+"\n"), 0o755); err != nil {
+				t.Fatalf("write stub: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			out, _, _, err := RunCollectQuiet(ctx, nil, 0, nil, bin)
+			if tc.wantErrIs != nil {
+				if !errors.Is(err, tc.wantErrIs) {
+					t.Fatalf("%d bytes against a %d-byte limit: err = %v, want %v",
+						tc.size, collectStdoutLimit, err, tc.wantErrIs)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%d bytes against a %d-byte limit must be accepted: %v",
+					tc.size, collectStdoutLimit, err)
+			}
+			if len(out) != tc.wantOutLen {
+				t.Errorf("kept %d of %d bytes, want all of them", len(out), tc.wantOutLen)
+			}
+		})
+	}
+}
+
+// TestCollectStdoutLimitHasHeadroomOverTheLargestAnswer is the derivation behind
+// collectStdoutLimit, made executable — the review found the value asserted with
+// no upstream limit, measured high-water mark, or capacity argument behind it.
+//
+// The largest answer any call site asks this collector for is the fully resolved
+// OpenClaw config (`config get --json`), whose size scales with the user's agents
+// and MCP servers. Upstream publishes no ceiling on either, so the derivation is
+// a constructed high-water mark: a host far past anything a real deployment has,
+// with the fields OpenClaw actually carries, and a stated multiple on top.
+//
+// It runs the payload through the collector rather than only comparing lengths,
+// so the assertion covers the whole path a large answer takes — chunked reads,
+// the head-capped buffer, and the completeness rule.
+func TestCollectStdoutLimitHasHeadroomOverTheLargestAnswer(t *testing.T) {
+	// The multiple on top of the constructed worst case. 8x, so a host an order
+	// of magnitude past the construction is still inside the bound.
+	const wantHeadroom = 8
+
+	payload := openclawResolvedConfigHighWaterMark(t)
+	t.Logf("constructed high-water mark: %d bytes (%d agents, %d mcp servers); "+
+		"collectStdoutLimit = %d (%.0fx)",
+		len(payload), highWaterMarkAgents, highWaterMarkMcpServers,
+		collectStdoutLimit, float64(collectStdoutLimit)/float64(len(payload)))
+
+	if collectStdoutLimit < wantHeadroom*len(payload) {
+		t.Errorf("collectStdoutLimit = %d leaves less than %dx over the largest "+
+			"answer we ask for (%d bytes); a legal config past the cap cannot start "+
+			"a task at all, so this bound has to be derived rather than picked",
+			collectStdoutLimit, wantHeadroom, len(payload))
+	}
+
+	catBin, lookErr := exec.LookPath("cat")
+	if lookErr != nil {
+		t.Skipf("no cat binary to emit the payload verbatim: %v", lookErr)
+	}
+	dir := t.TempDir()
+	payloadPath := filepath.Join(dir, "resolved-config.json")
+	if err := os.WriteFile(payloadPath, payload, 0o600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	bin := filepath.Join(dir, "fake-cli")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+catBin+" "+payloadPath+"\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	out, _, _, err := RunCollectQuiet(ctx, nil, 0, JSONOutputComplete, bin)
+	if err != nil {
+		t.Fatalf("the largest answer we ask for must come back cleanly: %v", err)
+	}
+	if !bytes.Equal(out, payload) {
+		t.Errorf("answer came back changed: %d bytes of %d", len(out), len(payload))
+	}
+}
+
+const (
+	// Deliberately past any real deployment: the largest OpenClaw configs seen in
+	// the field carry single-digit agent counts.
+	highWaterMarkAgents     = 1000
+	highWaterMarkMcpServers = 250
+)
+
+// openclawResolvedConfigHighWaterMark builds a `config get --json` payload for a
+// host at the scale above, with the fields OpenClaw's resolved config actually
+// carries, so its size is a defensible worst case rather than a round number.
+func openclawResolvedConfigHighWaterMark(t *testing.T) []byte {
+	t.Helper()
+
+	agents := make([]map[string]any, 0, highWaterMarkAgents)
+	for i := range highWaterMarkAgents {
+		agents = append(agents, map[string]any{
+			"id":        fmt.Sprintf("agent-with-a-descriptive-name-%04d", i),
+			"workspace": fmt.Sprintf("/Users/somebody/work/very/deeply/nested/checkout-%04d/service", i),
+			"model": map[string]any{
+				"primary":  "anthropic/claude-sonnet-4-6",
+				"fallback": "openai/gpt-5.5-codex-preview",
+			},
+			"instructions": "Follow the repository guidelines, prefer small changes, and " +
+				"always run the package's tests before handing work back for review.",
+			"skills":      []string{"code-review", "release-notes", "incident-triage", "migrations"},
+			"permissions": map[string]any{"edit": true, "shell": true, "network": false},
+		})
+	}
+
+	servers := make(map[string]any, highWaterMarkMcpServers)
+	for i := range highWaterMarkMcpServers {
+		servers[fmt.Sprintf("mcp-server-%04d", i)] = map[string]any{
+			"command": "/opt/homebrew/bin/node",
+			"args":    []string{fmt.Sprintf("/Users/somebody/.openclaw/servers/server-%04d/dist/index.js", i), "--stdio"},
+			"env": map[string]string{
+				"SERVER_TOKEN": "__OPENCLAW_REDACTED__",
+				"SERVER_HOME":  fmt.Sprintf("/Users/somebody/.openclaw/servers/server-%04d", i),
+			},
+		}
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"agents": map[string]any{"list": agents},
+		"mcp":    map[string]any{"servers": servers},
+	})
+	if err != nil {
+		t.Fatalf("build high-water-mark payload: %v", err)
+	}
+	return payload
 }

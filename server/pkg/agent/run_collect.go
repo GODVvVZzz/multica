@@ -80,12 +80,45 @@ const collectDrainGrace = 2 * time.Second
 //   - stdout is the answer, and silently dropping part of an answer is how a
 //     truncated catalog becomes a "successful" empty one. So it is capped and
 //     the overflow is reported as an error instead: a one-shot response that
-//     exceeds this is a malfunction, not a large answer.
+//     exceeds this is a malfunction, not a large answer. Where that cap falls is
+//     derived from the largest answer these call sites ask for; see
+//     collectStdoutLimit below.
 const collectStderrTail = probeStderrSampleBytes
 
 // A var, not a const, so a test can shrink it rather than generating megabytes to
 // reach it — the same reason detectVersionTimeout is one. Production never
 // reassigns it.
+//
+// 8 MiB is derived rather than picked, because where this falls is a product
+// compatibility boundary and not only a memory bound: a legal config past the cap
+// stops a task from starting. The derivation, in the order it constrains the
+// value:
+//
+//   - What is actually asked for. Measured on OpenClaw 2026.7.1-2:
+//     `config validate --json` answers in 715 bytes and `config file` in 2663.
+//     The largest answer any call site asks for is the fully resolved config from
+//     `config get --json`, whose size scales with the user's agents and MCP
+//     servers.
+//   - There is no upstream ceiling on either, so the worst case is constructed:
+//     1000 agents and 250 MCP servers, with the fields OpenClaw's resolved config
+//     carries, serialises to 547,291 bytes. Real deployments carry single-digit
+//     agent counts, so that is already orders of magnitude past the field. This
+//     bound leaves 15x on top of *it*, which is what
+//     TestCollectStdoutLimitHasHeadroomOverTheLargestAnswer asserts — the
+//     construction lives in the test so the derivation cannot drift from the
+//     value silently.
+//   - It matches what the daemon already holds for a comparable per-task payload
+//     it reads whole into memory (internal/daemon's maxLocalSkillBundleSize is the
+//     same 8 MiB), so the two limits do not have to be reasoned about separately.
+//     Named rather than imported: pkg/agent is the lower layer.
+//
+// A cap of some size is unavoidable rather than a design choice: every caller
+// parses the answer as one document, so an answer that cannot be held in memory
+// cannot be used either. What the derivation buys is that the boundary sits far
+// outside any answer a real host produces, and TestCollectedStdoutBoundaryIsExact
+// pins exactly where it is — at the limit the answer is returned whole, one byte
+// past it fails closed with errCollectStdoutTooLarge instead of being silently
+// shortened.
 var collectStdoutLimit = 8 << 20
 
 // outputBuffer accumulates one stream and records when the last write landed.
