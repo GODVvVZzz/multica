@@ -1299,6 +1299,111 @@ func TestPrepareOpenclawConfigTreatsMissingMcpKeyAsEmpty(t *testing.T) {
 	}
 }
 
+// TestPrepareOpenclawConfigResetStagePairsWithWrapperMcp pins the invariant the
+// reset stage's safety hangs on: every generated chain that contains
+// openclawMcpResetFile must come with an `mcp` object on the wrapper itself.
+//
+// The reset works because OpenClaw's include merge treats a non-object source
+// as wholesale replacement (`src/config/includes.ts:129-145` at v2026.7.1-2) —
+// but the same loader rejects a *surviving* null at validation:
+// `McpConfigSchema` is `.strict().optional()` (`src/config/zod-schema.ts:465-471`),
+// and zod's `.optional()` accepts undefined, never null. The only thing standing
+// between the reset and that rejection is the wrapper's own `mcp` block, which
+// the loader merges over the include result (`src/config/includes.ts:200-222`).
+//
+// Today the pairing holds by construction — the reset is written under
+// `hasManagedMcp && exists`, and buildPerTaskOpenclawConfig emits `mcp` under
+// `hasManagedMcp` — but nothing named that coupling. A refactor that emits the
+// reset without the wrapper block (an empty managed set optimized away, say)
+// would fail every managed-MCP task at agent start with an `invalid_type` on
+// `mcp` pointing nowhere near this package. Fail-closed, but with a diagnostic
+// bad enough that this test exists to keep it from ever firing. The real-CLI
+// smoke verifies the same composition end to end, but weekly and off-PR; this
+// is the assertion that fails in the PR that breaks the pairing.
+func TestPrepareOpenclawConfigResetStagePairsWithWrapperMcp(t *testing.T) {
+	cases := []struct {
+		name        string
+		resolvedMcp openclawResponse
+		mcpConfig   json.RawMessage
+	}{
+		{
+			// The sharpest case: no non-server siblings to restore, so the
+			// snapshot carries no `mcp` of its own and the resolved chain is
+			// `mcp: null` until the wrapper's block lands.
+			name:        "user servers only, nothing restored",
+			resolvedMcp: openclawResponse{stdout: `{"servers":{"user-only":{"command":"user"}}}`},
+			mcpConfig:   json.RawMessage(`{"mcpServers":{"managed":{"command":"managed"}}}`),
+		},
+		{
+			name:        "user siblings restored via the snapshot",
+			resolvedMcp: openclawResponse{stdout: `{"servers":{"user-only":{"command":"user"}},"sessionIdleTtlMs":300000}`},
+			mcpConfig:   json.RawMessage(`{"mcpServers":{"managed":{"command":"managed"}}}`),
+		},
+		{
+			name:        "empty managed set",
+			resolvedMcp: openclawResponse{stdout: `{"servers":{"user-only":{"command":"user"}}}`},
+			mcpConfig:   json.RawMessage(`{"mcpServers":{}}`),
+		},
+		{
+			name:        "user has no mcp key",
+			resolvedMcp: openclawResponse{err: errors.New("openclaw config get mcp --json: exit status 1 (stderr: Config path not found: mcp)")},
+			mcpConfig:   json.RawMessage(`{"mcpServers":{"managed":{"command":"managed"}}}`),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envRoot := t.TempDir()
+			workDir := filepath.Join(envRoot, "workdir")
+			if err := os.MkdirAll(workDir, 0o755); err != nil {
+				t.Fatalf("mkdir workdir: %v", err)
+			}
+			userCfgPath := filepath.Join(t.TempDir(), "openclaw.json")
+			if err := os.WriteFile(userCfgPath, []byte(`{}`), 0o600); err != nil {
+				t.Fatalf("write user cfg: %v", err)
+			}
+			stub := installOpenclawStub(t, map[string]openclawResponse{
+				"config file":                   {stdout: userCfgPath},
+				"config get agents.list --json": {stdout: "null"},
+				"config get mcp --json":         tc.resolvedMcp,
+			})
+
+			result, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{
+				OpenclawBin: stub.bin,
+				McpConfig:   tc.mcpConfig,
+			})
+			if err != nil {
+				t.Fatalf("prepareOpenclawConfig: %v", err)
+			}
+
+			// The chain must actually contain the reset stage...
+			resetPath := filepath.Join(envRoot, openclawMcpResetFile)
+			reset := mustReadJSON(t, resetPath)
+			if value, present := reset["mcp"]; !present || value != nil {
+				t.Fatalf("mcp reset = %#v, want explicit null", reset)
+			}
+			snapshot := mustReadJSON(t, filepath.Join(envRoot, openclawUserSnapshotFile))
+			include, ok := snapshot["$include"].([]any)
+			if !ok || len(include) != 2 || include[1] != resetPath {
+				t.Fatalf("snapshot $include = %#v, want [user config, %q]", snapshot["$include"], resetPath)
+			}
+
+			// ...and then the wrapper must carry its own `mcp` object. This is
+			// what overwrites the chain's transient `mcp: null` before
+			// validation; without it the loader rejects the resolved config.
+			wrapper := mustReadJSON(t, result.ConfigPath)
+			mcp, ok := wrapper["mcp"].(map[string]any)
+			if !ok {
+				t.Fatalf("reset stage present but wrapper has no mcp object — the "+
+					"resolved chain would be `mcp: null`, which OpenClaw's schema "+
+					"rejects, failing every managed-MCP task at load: %v", wrapper)
+			}
+			if _, ok := mcp["servers"].(map[string]any); !ok {
+				t.Fatalf("wrapper mcp.servers is not an object: %#v", mcp)
+			}
+		})
+	}
+}
+
 // TestPrepareOpenclawConfigFailsClosedOnMalformedMcpConfig — keeping with
 // the fail-closed posture used for the rest of the preparer: a malformed
 // mcp_config must not write any wrapper file, so the daemon surfaces the

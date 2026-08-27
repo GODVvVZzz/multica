@@ -38,6 +38,12 @@ const openclawUserSnapshotFile = "openclaw-user-snapshot.json"
 // the sanitized MCP settings. OpenClaw's include merge treats a primitive source
 // as replacement, so this resets the entire user MCP object before the next
 // merge restores the allowed siblings.
+//
+// A chain that carries this stage must always be paired with an `mcp` object on
+// the wrapper: the loader merges sibling keys over the include result, and a
+// null that instead survives to the resolved root fails OpenClaw's schema
+// validation (zod `.strict().optional()` rejects null), taking the whole config
+// load down. See TestPrepareOpenclawConfigResetStagePairsWithWrapperMcp.
 const openclawMcpResetFile = "openclaw-mcp-reset.json"
 
 // openclawCLITimeout is the default context deadline set on each
