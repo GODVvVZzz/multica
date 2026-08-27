@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -70,9 +71,54 @@ func TestDetectCLIVersionWaitsForAWrapperDescendant(t *testing.T) {
 	if oerr != nil {
 		t.Fatalf("outputOwned baseline: %v", oerr)
 	}
-	if !strings.Contains(extractVersionLine(string(out)), "1.2.3") {
+	baseline, _ := extractVersionLine(string(out))
+	if !strings.Contains(baseline, "1.2.3") {
 		t.Fatalf("baseline outputOwned = %q, want the version — the stub is wrong, "+
 			"not the code under test", out)
+	}
+}
+
+// TestDetectCLIVersionDoesNotSalvageABannerAsTheVersion pins the third-round
+// review finding: the ErrWaitDelay salvage was gated on `version != ""`, and
+// extractVersionLine's trimmed-raw fallback makes any non-empty text satisfy
+// that — including a line the wrapper printed before the real version existed.
+//
+// Measured on the reviewed head with this stub: detectCLIVersion returned
+// version="initializing plugins" with a nil error in 2.31s, and logged "CLI
+// answered but left its output pipes open" — the opposite of what happened. The
+// banner would then be persisted as the runtime's version for every one of the 23
+// providers, since DetectVersion routes them all through here.
+//
+// The contract: when the bound expires and no *recognised* version arrived, the
+// original error stands. There is no answer to salvage.
+func TestDetectCLIVersionDoesNotSalvageABannerAsTheVersion(t *testing.T) {
+	// Banner on stdout, leader exits 0, and the real version arrives from a
+	// descendant holding the pipe well past the 2s WaitDelay this probe sets.
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-cli")
+	body := "#!/bin/sh\n" +
+		"printf 'initializing plugins\\n'\n" +
+		"( sleep 5; printf 'fake-cli 1.2.3\\n' ) &\n" +
+		"exit 0\n"
+	if err := os.WriteFile(bin, []byte(body), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	got, err := detectCLIVersion(ctx, Command{Path: bin, logger: slog.Default()})
+	if err == nil {
+		t.Fatalf("detectCLIVersion = %q with a nil error; a banner is not the "+
+			"answer, so the ErrWaitDelay failure must stand", got)
+	}
+	if got != "" {
+		t.Errorf("version = %q, want empty — a failed probe must not report a "+
+			"version the CLI never gave", got)
+	}
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		t.Errorf("err = %v, want it to wrap exec.ErrWaitDelay (the bound that "+
+			"actually expired)", err)
 	}
 }
 

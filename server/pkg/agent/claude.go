@@ -1134,9 +1134,24 @@ func detectCLIVersion(ctx context.Context, runtimeCmd Command) (string, error) {
 	hideAgentWindow(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	data, err := outputOwned(cmd, runtimeCmd.logger)
-	version := extractVersionLine(string(data))
+	version, recognised := extractVersionLine(string(data))
 	if err != nil {
-		if salvaged := salvageProbeAnswer(runtimeCmd, "--version", version != "", err); salvaged {
+		// recognised, not `version != ""`. The two differ exactly where it
+		// matters: extractVersionLine falls back to the trimmed raw output when
+		// no line carries a semver token, so non-empty means "the CLI printed
+		// something", which on this path may be a banner its wrapper emitted
+		// before the real version existed. Review measured that — a stub
+		// printing "initializing plugins", exiting 0, with the version arriving
+		// after WaitDelay — registering `initializing plugins` as the version
+		// with a nil error. A salvage decision needs the stronger question, so
+		// it asks whether a version was actually recognised.
+		//
+		// The fallback still stands on the success path: a CLI that exits 0 with
+		// an unusual version format is reporting its version, and dropping that
+		// to empty would be a regression (#2516). It is only unusable as
+		// evidence that a *bounded, incomplete* read already contains the
+		// answer.
+		if salvaged := salvageProbeAnswer(runtimeCmd, "--version", recognised, err); salvaged {
 			return version, nil
 		}
 		// One provider-agnostic boundary for probes: DetectVersion routes every
@@ -1162,9 +1177,11 @@ func detectCLIVersion(ctx context.Context, runtimeCmd Command) (string, error) {
 // Deliberately narrow, because "we have output" must never be confused with "we
 // have the answer":
 //
-//   - answered is the caller's own parse, not a length check. A version is
-//     salvaged only if extractVersionLine found one, a catalog only if it
-//     parsed. Partial output cannot satisfy that.
+//   - answered is the caller's own *recognition* of the answer, not a length
+//     check and not a parse that falls back to accepting anything. A version is
+//     salvaged only if extractVersionLine matched a version-shaped line — its
+//     trimmed-raw fallback does not qualify, since a wrapper's banner satisfies
+//     it — and a catalog only if it parsed.
 //   - Only ErrWaitDelay qualifies. A non-zero exit still fails: a CLI that
 //     printed something and then exited 1 is reporting a problem, and its stderr
 //     is the diagnosis. Cancellation and deadlines still fail too — reaching the
@@ -1193,17 +1210,24 @@ func salvageProbeAnswer(runtimeCmd Command, probe string, answered bool, err err
 // or "codex-cli 0.118.0" survive unchanged because the whole matching line is
 // returned. If no line carries a semver token, fall back to the trimmed raw
 // output so unusual version formats aren't silently dropped to empty.
-func extractVersionLine(raw string) string {
+//
+// The second return reports whether that scan actually matched, i.e. whether the
+// first return is a recognised version or only the fallback. It exists because
+// the fallback accepts *any* non-empty text, which is fine when the CLI exited
+// cleanly (it said what it says) and unusable as evidence when a caller has to
+// decide whether an incomplete read already holds the answer — see
+// salvageProbeAnswer.
+func extractVersionLine(raw string) (string, bool) {
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		if versionRe.MatchString(line) {
-			return line
+			return line, true
 		}
 	}
-	return strings.TrimSpace(raw)
+	return strings.TrimSpace(raw), false
 }
 
 // logWriter adapts a *slog.Logger to an io.Writer for capturing stderr.
