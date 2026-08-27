@@ -674,9 +674,13 @@ func stripUserMcpServers(resolved map[string]any) {
 // fallback, because the two differ in whether the answer can be recognised:
 //
 //   - `config validate --json` puts the path in a named `path` field of a JSON
-//     document. Nothing else can be mistaken for it, and because argv carries
-//     `--json`, upstream routes incidental console output to stderr
-//     (`withConsoleLogsRoutedToStderrForJson`), so stdout is the document alone.
+//     document, and its stdout is that document and nothing else. Measured on
+//     OpenClaw 2026.7.1-2 with a warning-producing config: 715 bytes, one line,
+//     parseable whole. The Doctor and plugin warnings do not disappear — they
+//     arrive as a `warnings` array *inside* the payload, which is what keeps the
+//     stream parseable rather than merely quieter. (Upstream also has a
+//     console-log reroute for `--json` argv, `withConsoleLogsRoutedToStderrForJson`,
+//     but the structured payload is what was observed doing the work here.)
 //   - `config file` prints the path as its *last line*, after any Doctor and
 //     plugin warnings, on stdout. Deciding "is the answer in yet" then means
 //     asking whether the last line looks like a path — and a warning line that
@@ -687,10 +691,18 @@ func stripUserMcpServers(resolved map[string]any) {
 // Both commands perform the same `readConfigFileSnapshot()` read upstream
 // (checked at `v2026.7.1`: `runConfigFile` prints `shortenHomePath(snapshot.path)`
 // and `runConfigValidate` reports `snapshot.path`, `snapshot.exists` and
-// `snapshot.valid` from that same snapshot), so preferring the JSON form costs
-// nothing extra — validation is already part of the read `config file` does.
+// `snapshot.valid` from that same snapshot), so validation is already part of the
+// read `config file` does. Measured, the JSON form is not merely no worse but
+// meaningfully cheaper: 1.65/1.66/1.65s against 6.36/4.16/4.06s for `config file`
+// over three runs each on the same host and config, which tracks the output it
+// does not have to render — 715 bytes of JSON against 2663 bytes and 28 lines of
+// warning UI.
+//
 // `config validate --json` has carried the `path` field on every branch since
-// `v2026.5.5`, which is minOpenclawVersion.
+// `v2026.5.5`, which is minOpenclawVersion. Two of those branches exit non-zero —
+// a missing file and an invalid config, both with the path in the payload and
+// stderr empty — so the exit status must not be read as "no answer"; see
+// openclawValidatedConfigPath.
 //
 // OpenClaw 2026.2.x briefly rejected `openclaw config file` with the generic
 // "too many arguments for 'config'" error. For that command-shape failure only,
@@ -723,12 +735,14 @@ func openclawActiveConfigPath(bin string, timeout time.Duration) (string, bool, 
 // openclawValidatedConfigPath asks `openclaw config validate --json` for the
 // active config path, and reports whether the answer was unambiguous.
 //
-// The exit status is deliberately not consulted: upstream exits 1 both for a
-// missing config file and for an invalid one, and carries the path in the payload
-// either way (`{"valid":false,"path":"…","error":"file not found"}`). Whether the
-// user's config parses is not this function's question — prepareOpenclawConfig
-// needs to know *where* it is, and a fresh install with no file at all is a
-// normal, expected answer.
+// The exit status is deliberately not consulted, and that is the common case
+// rather than a corner: measured on 2026.7.1-2, upstream exits 1 both for a
+// missing config file (`{"valid":false,"path":"…","error":"file not found"}`) and
+// for an invalid one (`{"valid":false,"path":"…","issues":[…]}`), with stderr empty
+// and the path present in both. A fresh install is the missing-file case, so
+// reading a non-zero exit as "no answer" would break first run. Whether the user's
+// config parses is not this function's question either — openclaw itself reports
+// that when it runs; all that is owed here is where the file is.
 //
 // Failure is silent by design: every failure mode here is a reason to ask
 // `config file` instead, and reporting one would turn "this CLI answered in a
@@ -1221,10 +1235,11 @@ func openclawLastNonEmptyLine(out string) string {
 //
 //   - The document has to parse *as a whole*, so a response still being written
 //     cannot satisfy the rule, no matter how long the writer pauses mid-way.
-//   - Upstream routes incidental console output to stderr whenever argv carries
-//     `--json` (`withConsoleLogsRoutedToStderrForJson`, `src/cli/json-output-mode.ts`
-//     at `v2026.7.1`), so stdout carries the answer and nothing else. Without
-//     `--json`, Doctor and plugin warnings share stdout with the answer.
+//   - A `--json` stdout carries the document and nothing else. Measured on
+//     2026.7.1-2 with a warning-producing config, `config validate --json` emitted
+//     one 715-byte line that parses whole, with the Doctor and plugin warnings
+//     carried as a `warnings` array inside it. Without `--json` those same
+//     warnings are 28 lines of UI sharing stdout with the answer.
 //
 // An earlier revision of this branch also had a rule for `config file`: accept
 // the buffer once its last non-empty line looks like a path. Review broke it with

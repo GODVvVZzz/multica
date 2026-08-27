@@ -250,16 +250,21 @@ func TestExecOpenclawCLIToleratesNonExitingCLI(t *testing.T) {
 }
 
 // writeOpenclawConfigStub writes a stub CLI that answers `config validate --json`
-// with validateOut and `config file` with fileOut, and appends trailing to the
-// `config file` branch (for stubs that must linger or delay).
-func writeOpenclawConfigStub(t *testing.T, validateOut, fileOut, fileTrailing string) string {
+// with validateOut, exiting validateExit, and `config file` with fileOut, appending
+// trailing to the `config file` branch (for stubs that must linger or delay).
+//
+// validateExit is a parameter because a non-zero exit is the *normal* case for two
+// of the three states measured on a real host: upstream exits 1 both for a missing
+// config file and for an invalid one, and carries the path in the payload either
+// way. A stub that could only exit 0 would test the rarest branch.
+func writeOpenclawConfigStub(t *testing.T, validateOut string, validateExit int, fileOut, fileTrailing string) string {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "openclaw")
 	body := "#!/bin/sh\n" +
 		"if [ \"$1\" = \"config\" ] && [ \"$2\" = \"validate\" ]; then\n" +
 		validateOut +
-		"  exit 0\n" +
+		"  exit " + strconv.Itoa(validateExit) + "\n" +
 		"fi\n" +
 		"if [ \"$1\" = \"config\" ] && [ \"$2\" = \"file\" ]; then\n" +
 		fileOut +
@@ -298,7 +303,7 @@ func TestOpenclawActiveConfigPathIgnoresAPathShapedWarning(t *testing.T) {
 	}
 
 	bin := writeOpenclawConfigStub(t,
-		"  printf '{\"valid\":true,\"path\":\"%s\"}\\n' '"+realPath+"'\n",
+		"  printf '{\"valid\":true,\"path\":\"%s\"}\\n' '"+realPath+"'\n", 0,
 		"  printf 'plugin cache written to:\\n'\n  printf '%s\\n' '"+warnPath+"'\n",
 		"  sleep 6\n  printf '%s\\n' '"+realPath+"'\n")
 
@@ -333,16 +338,17 @@ func TestOpenclawActiveConfigPathFallsBackToConfigFile(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name        string
-		validateOut string
+		name         string
+		validateOut  string
+		validateExit int
 	}{
-		{"validate prints nothing", "  :\n"},
-		{"validate prints non-JSON", "  echo 'Unknown command: validate' >&2\n"},
-		{"validate omits the path field", "  printf '{\"valid\":true}\\n'\n"},
-		{"validate reports a relative path", "  printf '{\"valid\":false,\"path\":\"openclaw.json\"}\\n'\n"},
+		{"validate prints nothing", "  :\n", 0},
+		{"validate prints non-JSON", "  echo 'Unknown command: validate' >&2\n", 1},
+		{"validate omits the path field", "  printf '{\"valid\":true}\\n'\n", 0},
+		{"validate reports a relative path", "  printf '{\"valid\":false,\"path\":\"openclaw.json\"}\\n'\n", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bin := writeOpenclawConfigStub(t, tc.validateOut,
+			bin := writeOpenclawConfigStub(t, tc.validateOut, tc.validateExit,
 				"  printf '%s\\n' '"+realPath+"'\n", "")
 			got, exists, err := openclawActiveConfigPath(bin, 30*time.Second)
 			if err != nil {
@@ -350,6 +356,78 @@ func TestOpenclawActiveConfigPathFallsBackToConfigFile(t *testing.T) {
 			}
 			if got != realPath || !exists {
 				t.Errorf("path = %q exists = %v, want %q true", got, exists, realPath)
+			}
+		})
+	}
+}
+
+// TestOpenclawActiveConfigPathReadsThePathFromANonZeroExit pins the case that is
+// *normal* rather than exceptional, and which the first version of these tests
+// missed: `config validate --json` exits 1 both for a missing config file and for
+// an invalid one, and carries the path in its payload either way.
+//
+// A fresh install is the missing-file case, so treating a non-zero exit as "no
+// answer" would break the most common first-run path. Both payloads below are the
+// real shapes measured on OpenClaw 2026.7.1-2, with stderr empty in both.
+func TestOpenclawActiveConfigPathReadsThePathFromANonZeroExit(t *testing.T) {
+	dir := t.TempDir()
+	presentPath := filepath.Join(dir, "openclaw.json")
+	if err := os.WriteFile(presentPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	missingPath := filepath.Join(dir, "absent", "openclaw.json")
+
+	for _, tc := range []struct {
+		name       string
+		payload    string
+		want       string
+		wantExists bool
+	}{
+		{
+			// {"valid":false,"path":"…","error":"file not found"}, exit 1.
+			name:       "file not found",
+			payload:    `{"valid":false,"path":"` + missingPath + `","error":"file not found"}`,
+			want:       missingPath,
+			wantExists: false,
+		},
+		{
+			// {"valid":false,"path":"…","issues":[…]}, exit 1. The user's config is
+			// broken, which openclaw itself will report when it runs; all this
+			// resolution step owes the caller is where the file is.
+			name:       "invalid config",
+			payload:    `{"valid":false,"path":"` + presentPath + `","issues":[{"path":"<root>","message":"Invalid input"}]}`,
+			want:       presentPath,
+			wantExists: true,
+		},
+		{
+			// The healthy case still carries plugin warnings *inside* the document
+			// rather than as text before it, which is what keeps stdout a single
+			// parseable object.
+			name:       "valid with warnings in the payload",
+			payload:    `{"valid":true,"path":"` + presentPath + `","warnings":[{"path":"plugins.allow","message":"plugin not found: openclaw-lark"}]}`,
+			want:       presentPath,
+			wantExists: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exit := 1
+			if strings.Contains(tc.payload, `"valid":true`) {
+				exit = 0
+			}
+			bin := writeOpenclawConfigStub(t,
+				"  printf '%s\\n' '"+tc.payload+"'\n", exit,
+				"  echo 'config file must not be consulted'\n", "")
+
+			got, exists, err := openclawActiveConfigPath(bin, 30*time.Second)
+			if err != nil {
+				t.Fatalf("openclawActiveConfigPath: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("path = %q, want %q — the exit status must not decide whether "+
+					"the payload carries an answer", got, tc.want)
+			}
+			if exists != tc.wantExists {
+				t.Errorf("exists = %v, want %v", exists, tc.wantExists)
 			}
 		})
 	}
@@ -367,7 +445,7 @@ func TestOpenclawActiveConfigPathFailsClosedWhenConfigFileNeverExits(t *testing.
 	dir := t.TempDir()
 	realPath := filepath.Join(dir, "openclaw.json")
 	bin := writeOpenclawConfigStub(t,
-		"  echo 'validate unsupported' >&2\n",
+		"  echo 'validate unsupported' >&2\n", 1,
 		"  printf '%s\\n' '"+realPath+"'\n",
 		"  sleep 300\n")
 
