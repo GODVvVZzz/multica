@@ -286,6 +286,93 @@ func TestOpenclawOutputCompleteRules(t *testing.T) {
 	}
 }
 
+// TestOpenclawQuietIdleGraceCoversTheWarningGap pins the grace each subcommand
+// shape gets.
+//
+// Measured on a real host: with a config that produces Doctor and plugin
+// warnings, `openclaw config file` spread its stdout over 3289ms, of which one
+// 3285ms silence sat between the end of the warning block and the path. So the
+// gap that matters is not the one *inside* an answer — those writes are
+// microseconds apart — but the one between non-answer output and the answer, and
+// the default 400ms sits well inside it.
+//
+// `--json` commands are exempt because upstream routes incidental console output
+// to stderr when argv carries `--json`, so their stdout cannot contain a
+// non-answer prefix to strand a rule on in the first place.
+func TestOpenclawQuietIdleGraceCoversTheWarningGap(t *testing.T) {
+	const measuredWarningGap = 3285 * time.Millisecond
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want time.Duration
+	}{
+		{"config file gets more than the measured gap", []string{"config", "file"}, openclawConfigFileIdleGrace},
+		{"json keeps the default", []string{"config", "get", "--json"}, 0},
+		{"json keeps the default with a path", []string{"config", "get", "agents.list", "--json"}, 0},
+		{"agents list json keeps the default", []string{"agents", "list", "--json"}, 0},
+		{"an unknown shape keeps the default", []string{"doctor"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := openclawQuietIdleGrace(tc.args); got != tc.want {
+				t.Errorf("openclawQuietIdleGrace(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+
+	if openclawConfigFileIdleGrace <= measuredWarningGap {
+		t.Errorf("config file grace %v must exceed the measured warning gap %v, or the "+
+			"early return stays eligible to fire on a Doctor line",
+			openclawConfigFileIdleGrace, measuredWarningGap)
+	}
+}
+
+// TestExecOpenclawCLISurvivesTheWarningGapBeforeThePath is the behavioural half:
+// a CLI that prints a warning block, goes quiet for longer than the default
+// grace, then prints the real path must yield the path.
+//
+// The rule is what makes this safe — a box-drawing border is not an absolute
+// path, so the early return is not eligible during the gap — and the grace is
+// defence in depth for a rule that turns out to accept some warning line. This
+// test would pass on the border alone; it exists to pin the whole shape end to
+// end, at a gap length the default grace does not cover.
+func TestExecOpenclawCLISurvivesTheWarningGapBeforeThePath(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "openclaw")
+	want := filepath.Join(dir, "openclaw.json")
+	// The gap is scaled down from the measured 3285ms so the test stays quick,
+	// but it is still comfortably past DefaultQuietIdleGrace.
+	script := "#!/bin/sh\n" +
+		"printf '\\342\\224\\214\\342\\224\\200\\342\\224\\220\\n'\n" +
+		"printf '| doctor: something to look at |\\n'\n" +
+		"printf '\\342\\224\\224\\342\\224\\200\\342\\224\\230\\n'\n" +
+		"sleep 1\n" +
+		"printf '%s\\n' '" + want + "'\n" +
+		"sleep 300\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	out, err := execOpenclawCLI(ctx, bin, "config", "file")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("execOpenclawCLI: %v", err)
+	}
+	if got := openclawLastNonEmptyLine(out); got != want {
+		t.Errorf("answer = %q, want %q — a gap before the path must not strand the "+
+			"early return on the warning block", got, want)
+	}
+	// It must not have waited out the stub's `sleep 300`, i.e. the early return
+	// is what ended the call.
+	if elapsed > 15*time.Second {
+		t.Errorf("took %v — the early return did not fire", elapsed)
+	}
+}
+
 // TestExecOpenclawCLIToleratesNonExitingCLI covers the second failure mode.
 // Measured on the host, `openclaw config file` printed the path in ~250ms and
 // then hung until killed, which reached the user as

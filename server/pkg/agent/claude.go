@@ -1119,9 +1119,10 @@ func detectCLIVersion(ctx context.Context, runtimeCmd Command) (string, error) {
 	// The collector owns the pipes as *os.File instead, so os/exec starts no
 	// copy goroutine, Wait returns on the direct child's exit whatever a
 	// descendant is holding, and the real exit status is what gets reported.
-	// The tree is then reaped, so the grandchild does not linger as an orphan —
-	// runOwned's post-Wait group kill does that much already; what is new here
-	// is not paying for it with a false failure. See run_collect.go and
+	// The tree is then reaped, so a grandchild still in the leader's group does
+	// not linger as an orphan — runOwned's post-Wait group kill does that much
+	// already, and neither reaches one that left the group; what is new here is
+	// not paying for the wait with a false failure. See run_collect.go and
 	// MUL-5467.
 	//
 	// Built through runtimeCmd.exec so a custom runtime's fixed_args prefix is

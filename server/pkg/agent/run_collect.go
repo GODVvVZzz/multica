@@ -211,10 +211,13 @@ func startCollector(cmd *exec.Cmd, env []string) (*collector, error) {
 // Safe to call more than once and from any of the caller's exit paths.
 func (c *collector) finish() {
 	c.finishOnce.Do(func() {
-		// Reap whatever the CLI forked, on the success path too: a successful
-		// `openclaw --version` still leaves its helper behind, which is how
-		// orphans accumulate on a host that probes on a timer. This also
-		// releases the last write end so the readers below can see EOF.
+		// Reap whatever the CLI forked and left in the leader's group, on the
+		// success path too: a successful `openclaw --version` still leaves its
+		// helper behind, which is how orphans accumulate on a host that probes
+		// on a timer. A helper that called setsid is out of reach here — see
+		// guarantee 2 on RunCollect — but this is also what releases the last
+		// write end so the readers below can see EOF, which does not depend on
+		// the kill landing.
 		//
 		// Retried across collectReapWindow because a single pass loses a
 		// descendant that was mid-fork when the signal went out; see there.
@@ -320,15 +323,30 @@ func (c *collector) exitErr() (error, bool) {
 //
 //  1. Returns within roughly the caller's context deadline plus
 //     collectReapWindow and collectSettleGrace, whatever the CLI leaves behind.
-//  2. Descendants the CLI forked are signalled before returning, and the signal
-//     is repeated across collectReapWindow so one that was mid-fork does not
-//     escape — invoking a CLI on a timer cannot accumulate orphans.
+//
+//  2. Descendants that are still in the leader's process group are signalled
+//     before returning, and the signal is repeated across collectReapWindow so
+//     one that was mid-fork does not escape.
+//
+//     A descendant that left the group cannot be reached this way, and OpenClaw's
+//     helper is exactly that: measured on a real host, `openclaw-config` holds the
+//     same stdout pipe as its parent (both `pipe:[135202]`) but runs with its own
+//     PGID and SID. `kill(-pgid)` never reaches it, and neither does #7531's
+//     ownership, which uses the same group. What holds regardless is guarantee 1 —
+//     that is the point of owning the pipes rather than relying on the kill. On
+//     that host the helper exited with its parent, so no orphan accumulated; on a
+//     build where it outlives the parent, it would, and this layer cannot prevent
+//     that. Windows is different: the Job Object owns the tree irrespective of
+//     groups, so the assignment in startOwnedProcessTree does reach a descendant
+//     that would escape here.
+//
 //  3. Whenever the tree is reaped successfully — which is every case the OS lets
 //     us have — the reader goroutines and cmd.Wait have all returned before this
 //     call does. If the kill does not take, the residue is logged and the answer
 //     is still returned: a goroutine can stay parked reading a pipe a surviving
 //     descendant holds, and that is not removable from here. It is deliberately
 //     not reported as a call failure — see finish().
+//
 //  4. The command's real exit status is reported, which openclawShimDiagnostic
 //     depends on (it type-switches on *exec.ExitError).
 //

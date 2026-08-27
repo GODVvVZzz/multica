@@ -14,9 +14,20 @@ import (
 //
 // Sized for "the CLI already flushed its answer": these commands print a path or
 // a short JSON document, and the writes of one logical response land
-// back-to-back. 400ms is orders of magnitude longer than the gap between those
-// writes, and short enough that the calls task setup makes cost about a second
-// in the misbehaving case instead of a full openclawCLITimeout each.
+// back-to-back — measured at 0.012–0.033ms apart on a real host. 400ms is orders
+// of magnitude longer than that, and short enough that the calls task setup
+// makes cost about a second in the misbehaving case instead of a full
+// openclawCLITimeout each.
+//
+// What that sizing does *not* cover, and what the caller's `complete` rule has
+// to: a gap between output that is not the answer and the answer itself. On the
+// same host, a config that produces Doctor and plugin warnings put a single
+// 3285ms silence between the end of the warning block and the config path. Any
+// rule that accepts something printed before the answer therefore has 3.2s in
+// which to fire on it, and no default here can fix that — which is why the rules
+// live with the callers who know their command's output shape, and why a caller
+// whose command interleaves non-answer output on stdout should pass a larger
+// idleGrace as well (see openclawQuietIdleGrace).
 //
 // It is also the window in which a *late* failure can still be observed: a CLI
 // that prints a complete answer and then exits non-zero is reported as the

@@ -63,10 +63,16 @@ const openclawUserSnapshotFile = "openclaw-user-snapshot.json"
 //
 // execOpenclawCLI now goes through agent.RunCollectQuiet, which owns the pipes
 // (so Wait returns when the direct child exits, whatever a descendant is holding)
-// and owns the process tree (Unix process group, Windows Job Object), so the
-// descendant is reaped rather than orphaned. The deadline below is therefore
-// enforceable, and a host that needs more of it can say so through the override
-// rather than discovering that the limit was advisory.
+// and owns the process tree (Unix process group, Windows Job Object), so a
+// descendant that stayed in that tree is reaped rather than orphaned. The
+// deadline below is therefore enforceable, and a host that needs more of it can
+// say so through the override rather than discovering that the limit was
+// advisory.
+//
+// Enforceable is the claim, not "nothing survives": `openclaw-config` was
+// measured with its own PGID and SID, so on Unix no group signal reaches it. The
+// deadline holds anyway, because it is pipe ownership rather than the kill that
+// makes Wait return — see guarantee 2 on agent.RunCollect.
 const openclawCLITimeout = 30 * time.Second
 
 // OpenclawCLITimeoutEnv overrides openclawCLITimeout. Accepts a Go duration
@@ -1152,6 +1158,44 @@ func openclawConfigPathComplete(out []byte) bool {
 	return filepath.IsAbs(line)
 }
 
+// openclawQuietIdleGrace is how long stdout must stay silent, on top of already
+// carrying a complete answer, before the early return fires for this subcommand.
+//
+// Zero means agent.DefaultQuietIdleGrace, which is right for every `--json`
+// command: upstream routes incidental console output to stderr when argv carries
+// `--json` (`withConsoleLogsRoutedToStderrForJson`, `src/cli/json-output-mode.ts`
+// at `v2026.7.1`), so their stdout is the JSON document and nothing else. A
+// partial document does not parse, so no gap in the middle of one can produce a
+// wrong early return however long it lasts.
+//
+// `config file` has no `--json`, so that routing does not apply and the Doctor and
+// plugin warnings land on *stdout*, ahead of the path. Measured on a real host
+// with a warning-producing config: the whole response spans 3289ms, of which a
+// single 3285ms gap sits between the end of the Doctor block and the path. With
+// the default grace, the early return is eligible to fire inside that gap, on
+// whatever the warnings left in the buffer.
+//
+// openclawConfigPathComplete is what makes that safe, and it is the guarantee
+// here — a grace can only ever be defence in depth, since the gap is a property
+// of the host's plugin and Doctor work and no fixed value provably exceeds it.
+// This one is sized above the measured gap so a rule that turns out to accept
+// some warning line still has to lose a race it would previously have won by
+// three seconds. The cost is paid only by a CLI that hangs: `config file` then
+// returns in path + this, instead of path + 400ms, against a 30s deadline.
+func openclawQuietIdleGrace(args []string) time.Duration {
+	for _, a := range args {
+		if a == "--json" {
+			return 0
+		}
+	}
+	if len(args) >= 2 && args[0] == "config" && args[1] == "file" {
+		return openclawConfigFileIdleGrace
+	}
+	return 0
+}
+
+const openclawConfigFileIdleGrace = 5 * time.Second
+
 // openclawOutputComplete returns the rule that decides whether the bytes
 // captured so far are a finished answer for this openclaw subcommand, for
 // agent.RunCollectQuiet's early return.
@@ -1213,7 +1257,7 @@ func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, e
 	// alongside the error: annotateOpenclawJSONError reads it, and the typed
 	// timeout sentinel is what lets the daemon classify a local stall
 	// structurally.
-	raw, stderrOut, _, err := agent.RunCollectQuiet(ctx, os.Environ(), 0, openclawOutputComplete(args), bin, args...)
+	raw, stderrOut, _, err := agent.RunCollectQuiet(ctx, os.Environ(), openclawQuietIdleGrace(args), openclawOutputComplete(args), bin, args...)
 	stdout := string(raw)
 	if err != nil {
 		stderrMsg := strings.TrimSpace(stderrOut)
