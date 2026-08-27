@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // openclawCLIStub captures one or more (subcommand, response) pairs and
@@ -27,6 +28,12 @@ type openclawCLIStub struct {
 type openclawCall struct {
 	bin  string
 	args []string
+	// deadline is the ctx deadline this invocation ran under, zero if it had
+	// none. Recorded because the budget the ceiling is derived from counts
+	// deadlines, not calls: path resolution makes two invocations under one
+	// shared deadline, and a test that counted calls could not tell that apart
+	// from a fifth budget. See TestPrepareOpenclawConfigWorstCaseCLIBudgets.
+	deadline time.Time
 }
 
 type openclawResponse struct {
@@ -47,8 +54,9 @@ func installOpenclawStub(t *testing.T, responses map[string]openclawResponse) *o
 	return stub
 }
 
-func (s *openclawCLIStub) exec(_ context.Context, bin string, args ...string) (string, error) {
-	s.calls = append(s.calls, openclawCall{bin: bin, args: append([]string(nil), args...)})
+func (s *openclawCLIStub) exec(ctx context.Context, bin string, args ...string) (string, error) {
+	deadline, _ := ctx.Deadline()
+	s.calls = append(s.calls, openclawCall{bin: bin, args: append([]string(nil), args...), deadline: deadline})
 	key := strings.Join(args, " ")
 	if resp, ok := s.responses[key]; ok {
 		return resp.stdout, resp.err
