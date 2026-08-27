@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1105,38 +1106,80 @@ func detectCLIVersion(ctx context.Context, runtimeCmd Command) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, detectVersionTimeout)
 	defer cancel()
 
-	// RunCollectCmd, not outputOwned: a broken CLI (node/bun shim) can leave
-	// grandchildren that inherited and still hold our stdout pipe open. Both
-	// helpers own the process tree, but outputOwned hands os/exec a
-	// bytes.Buffer, so os/exec owns the copy goroutines and Wait blocks until
-	// the pipes reach EOF — which the grandchild controls, not us. It bounds
-	// that with probeWaitDelay (2s, the same backstop this call used to set by
-	// hand), and a bounded Wait returns exec.ErrWaitDelay: the version is
-	// already in the buffer and the probe reports failure anyway. On this path
-	// that is the expensive kind of wrong, because a failed --version skips
-	// runtime registration entirely.
+	// outputOwned, not the collector in run_collect_quiet.go, and the difference
+	// is which signal means "the answer is in". A broken CLI (node/bun shim) can
+	// leave grandchildren that inherited and still hold our stdout pipe open, and
+	// os/exec's Wait blocks until those pipes reach EOF — which is why this call
+	// carries a WaitDelay backstop, and why the deadline above needs one at all.
 	//
-	// The collector owns the pipes as *os.File instead, so os/exec starts no
-	// copy goroutine, Wait returns on the direct child's exit whatever a
-	// descendant is holding, and the real exit status is what gets reported.
-	// The tree is then reaped, so a grandchild still in the leader's group does
-	// not linger as an orphan — runOwned's post-Wait group kill does that much
-	// already, and neither reaches one that left the group; what is new here is
-	// not paying for the wait with a false failure. See run_collect.go and
-	// MUL-5467.
+	// An earlier revision of this branch used the collector here, so that Wait
+	// returned on the *direct child's* exit whatever a descendant was holding.
+	// That is wrong on this path: a wrapper may exit successfully while the real
+	// CLI, its descendant, still owes us the version. Review measured it — the
+	// wrapper exits 0, its child prints the version 500ms later, and treating
+	// leader exit as completion killed the child and returned an empty version
+	// with a nil error, where outputOwned returns the version. Pipe EOF is the
+	// only signal that means "no more output is coming"; leader exit does not.
+	//
+	// What this branch still fixes here is the *reporting*: a lingering
+	// descendant makes Wait hit WaitDelay and report exec.ErrWaitDelay even
+	// though the version arrived, and a failed --version probe skips runtime
+	// registration entirely (#6084 reverted a WaitDelay backstop over exactly
+	// that). So the error is dropped when — and only when — the answer itself is
+	// present. See salvageProbeAnswer.
 	//
 	// Built through runtimeCmd.exec so a custom runtime's fixed_args prefix is
-	// still applied (MUL-6260); the collector is handed the finished command.
+	// still applied (MUL-6260).
 	cmd := runtimeCmd.exec(ctx, "--version")
-	data, _, err := RunCollectCmd(ctx, cmd, nil)
+	hideAgentWindow(cmd)
+	cmd.WaitDelay = 2 * time.Second
+	data, err := outputOwned(cmd, runtimeCmd.logger)
+	version := extractVersionLine(string(data))
 	if err != nil {
+		if salvaged := salvageProbeAnswer(runtimeCmd, "--version", version != "", err); salvaged {
+			return version, nil
+		}
 		// One provider-agnostic boundary for probes: DetectVersion routes every
 		// provider through here, so an ENOEXEC diagnosis added at this point
 		// reaches the reason the daemon reports for a skipped runtime
 		// (MUL-6164).
 		return "", fmt.Errorf("detect version for %s: %w", runtimeCmd, ExplainExecError(err))
 	}
-	return extractVersionLine(string(data)), nil
+	return version, nil
+}
+
+// salvageProbeAnswer decides whether a one-shot probe that produced its answer
+// may ignore the error os/exec reported, and logs the decision.
+//
+// It exists for one shape: the CLI printed what we asked for, and then something
+// about its *lifecycle* failed — a descendant held the output pipes past
+// cmd.WaitDelay (exec.ErrWaitDelay), so Wait reports failure over an answer that
+// is already in the buffer. OpenClaw does this on every invocation: it forks an
+// `openclaw-config` helper that inherits stdout. #6084 measured that shape,
+// tried a WaitDelay backstop, and reverted it on review precisely because the
+// call then fails; MUL-5467 is the follow-up.
+//
+// Deliberately narrow, because "we have output" must never be confused with "we
+// have the answer":
+//
+//   - answered is the caller's own parse, not a length check. A version is
+//     salvaged only if extractVersionLine found one, a catalog only if it
+//     parsed. Partial output cannot satisfy that.
+//   - Only ErrWaitDelay qualifies. A non-zero exit still fails: a CLI that
+//     printed something and then exited 1 is reporting a problem, and its stderr
+//     is the diagnosis. Cancellation and deadlines still fail too — reaching the
+//     deadline means the CLI never finished, and this is not the layer that
+//     decides a timeout was acceptable.
+func salvageProbeAnswer(runtimeCmd Command, probe string, answered bool, err error) bool {
+	if !answered || !errors.Is(err, exec.ErrWaitDelay) {
+		return false
+	}
+	if runtimeCmd.logger != nil {
+		runtimeCmd.logger.Warn("agent: CLI answered but left its output pipes open; "+
+			"using the answer and reaping the tree",
+			"command", runtimeCmd.String(), "probe", probe, "err", err)
+	}
+	return true
 }
 
 // extractVersionLine pulls the version line out of a `<cli> --version` capture,

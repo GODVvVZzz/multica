@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os/exec"
 	"time"
 )
@@ -24,10 +26,16 @@ import (
 // same host, a config that produces Doctor and plugin warnings put a single
 // 3285ms silence between the end of the warning block and the config path. Any
 // rule that accepts something printed before the answer therefore has 3.2s in
-// which to fire on it, and no default here can fix that — which is why the rules
-// live with the callers who know their command's output shape, and why a caller
-// whose command interleaves non-answer output on stdout should pass a larger
-// idleGrace as well (see openclawQuietIdleGrace).
+// which to fire on it, and no value here can fix that — review demonstrated it
+// against a 5s grace with a warning line that was itself a path.
+//
+// So the requirement lands on the rules rather than on this constant: a rule must
+// be unsatisfiable by anything the CLI prints before its answer. The only rule in
+// this package that qualifies is JSONOutputComplete, because a document has to
+// parse as a whole and because upstream keeps incidental output off a `--json`
+// stdout entirely. Judging human-readable output by shape does not qualify, and
+// the `config file` rule that tried was removed rather than retuned — see
+// openclawOutputComplete in internal/daemon/execenv.
 //
 // It is also the window in which a *late* failure can still be observed: a CLI
 // that prints a complete answer and then exits non-zero is reported as the
@@ -99,7 +107,10 @@ func JSONOutputComplete(stdout []byte) bool {
 //   - `complete` accepts the buffer. Idle alone is not enough, because the CLI
 //     may be pausing between a banner and the real answer — `openclaw config
 //     file` prints Doctor warning UI first (see MUL-3136), and cutting off there
-//     yields the banner instead of the path.
+//     yields the banner instead of the path. The rule carries the whole weight of
+//     that distinction: review broke a rule that judged the path by *shape* with a
+//     warning line that was itself a path, so a rule has to be one the CLI's
+//     pre-answer output cannot satisfy at all.
 //   - The buffer has then been idle for idleGrace. Complete alone is not enough,
 //     because more output may still follow and change the answer.
 //
@@ -114,11 +125,31 @@ func JSONOutputComplete(stdout []byte) bool {
 // quiet reports that the return did not come from a clean exit, so callers can
 // log the CLI's misbehaviour without failing on it.
 //
+// Guarantees callers depend on:
+//
+//  1. Returns within roughly the caller's context deadline plus collectDrainGrace,
+//     collectReapWindow and collectSettleGrace, whatever the CLI leaves behind.
+//  2. Descendants that are still in the leader's process group are signalled
+//     before returning, and the signal is repeated across collectReapWindow so one
+//     that was mid-fork does not escape. A descendant that left the group is out
+//     of reach on Unix — OpenClaw's helper was measured with its own PGID and SID —
+//     which is why guarantee 1 does not depend on the kill landing. Windows is
+//     different: the Job Object owns the tree irrespective of groups.
+//  3. Output is not abandoned while something may still be writing it: after the
+//     direct child exits, the call waits for pipe EOF unless `complete` says the
+//     answer is in. Leader exit alone is not treated as completion.
+//  4. Retention is bounded — collectStdoutLimit for the answer (reported, not
+//     silently truncated) and collectStderrTail for the diagnostic sample.
+//  5. The command's real exit status is reported, which openclawShimDiagnostic
+//     depends on (it type-switches on *exec.ExitError).
+//
 // Use this only for commands whose entire output is a short one-shot response.
 // Anything that streams incrementally (agent execution) must keep its own
 // lifecycle handling, where a pause in output carries meaning.
 func RunCollectQuiet(ctx context.Context, env []string, idleGrace time.Duration, complete OutputComplete, execPath string, args ...string) (stdout []byte, stderr string, quiet bool, err error) {
-	// Command.exec for the same reason as RunCollect; see the note there.
+	// Command.exec, not exec.CommandContext: launch.go owns process construction so
+	// a custom runtime's fixed_args prefix cannot be dropped (GH #7046). A zero
+	// Command has no prefix, which is what a bare path argument means here.
 	return RunCollectQuietCmd(ctx, Command{Path: execPath}.exec(ctx, args...), env, idleGrace, complete)
 }
 
@@ -140,10 +171,17 @@ func RunCollectQuietCmd(ctx context.Context, cmd *exec.Cmd, env []string, idleGr
 	for {
 		select {
 		case <-c.waitDone:
-			// Clean exit, or a real non-zero one: the normal path, and it pays
-			// no idle wait at all.
+			// The direct child is gone, which is not the same as "no more output
+			// is coming" — a wrapper may have exited while the real CLI still
+			// owes us the answer. Wait for pipe EOF, bounded, unless the answer
+			// is already in; see awaitOutputAfterExit.
+			c.awaitOutputAfterExit(ctx, complete)
 			c.finish()
-			return c.stdout.snapshot(), string(c.stderr.snapshot()), false, c.waitErr
+			out := c.stdout.snapshot()
+			if c.stdout.overflowed() {
+				return out, string(c.stderr.snapshot()), false, collectStdoutOverflowErr()
+			}
+			return out, string(c.stderr.snapshot()), false, c.waitErr
 
 		case <-ctx.Done():
 			c.finish()
@@ -175,7 +213,26 @@ func RunCollectQuietCmd(ctx context.Context, cmd *exec.Cmd, env []string, idleGr
 			// snapshot — bytes a lingering descendant appends after that verdict
 			// were never part of the answer and could only break the parse.
 			c.finish()
+			if c.stdout.overflowed() {
+				return out, string(c.stderr.snapshot()), true, collectStdoutOverflowErr()
+			}
 			return out, string(c.stderr.snapshot()), true, nil
 		}
 	}
+}
+
+// errCollectStdoutTooLarge reports that the answer exceeded collectStdoutLimit.
+//
+// Reported rather than returned quietly: these helpers run one-shot commands
+// whose response is a path or a short document, so overflow means the CLI is
+// malfunctioning, and a caller that parsed a head-truncated answer would be
+// parsing something the CLI never said. stderr is capped by keeping its tail
+// instead, because it is a diagnostic sample and not an answer — dropping its
+// front loses nothing a caller relies on.
+var errCollectStdoutTooLarge = errors.New("collected stdout exceeded its limit")
+
+// collectStdoutOverflowErr names the limit in the message while keeping
+// errCollectStdoutTooLarge as the sentinel callers match on.
+func collectStdoutOverflowErr() error {
+	return fmt.Errorf("%w (%d bytes)", errCollectStdoutTooLarge, collectStdoutLimit)
 }

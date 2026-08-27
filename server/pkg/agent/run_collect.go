@@ -32,14 +32,61 @@ const (
 // tree has been signalled, how long finish() waits for the reader goroutines to
 // see EOF before handing the caller what arrived.
 //
-// Short on purpose, and it cannot truncate a well-behaved CLI's answer. Once the
-// direct child has exited, at most one pipe buffer of its output can still be
-// unread — a child that had written more than that would have blocked in write()
-// and could not have exited — and that is drained at memory speed. What the cap
-// cuts short is a descendant that inherited the pipe and holds it open, whose
-// trailing output is not the answer. EOF short-circuits the wait, so the normal
-// case pays nothing at all.
+// Short on purpose, and by the time it runs the caller has already decided that
+// reading is over — either the answer satisfied its completeness rule, or
+// collectDrainGrace expired waiting for one. What this cap cuts short is a
+// descendant that inherited the pipe and holds it open, whose trailing output is
+// not the answer. EOF short-circuits the wait, so the normal case pays nothing.
 const collectSettleGrace = 400 * time.Millisecond
+
+// collectDrainGrace bounds the wait for pipe EOF *after* the direct child has
+// exited, before the tree is reaped.
+//
+// This exists because leader exit is not the end of output, and treating it as
+// one is a data-loss bug rather than a slow path. A wrapper can exit
+// successfully while the real CLI — its descendant, which inherited stdout — has
+// not printed yet; npm and PowerShell shims make that the normal shape on
+// Windows. Review measured the consequence on an earlier revision of this
+// branch: the wrapper exits 0, its child prints the version 500ms later, and
+// reaping on leader exit returned an empty answer with a nil error, where
+// os/exec's own EOF wait returns the version.
+//
+// So EOF is the signal, and this is its bound. 2s matches probeWaitDelay, which
+// is the equivalent bound os/exec applies for the same reason on the
+// launch.go helpers — a descendant that never closes the pipe must not hold the
+// call forever.
+//
+// A caller's completeness rule short-circuits it: once the answer is in the
+// buffer there is nothing left to wait for, so the normal case — a CLI that
+// prints its answer and exits, with or without a lingering helper — pays
+// nothing.
+const collectDrainGrace = 2 * time.Second
+
+// collectStdoutLimit caps the answer this package will accumulate, and
+// collectStderrTail caps the diagnostic sample kept from stderr.
+//
+// Both streams were unbounded in an earlier revision, and review measured the
+// cost: a CLI writing continuously for the probe window retained 13,107,400
+// bytes of stderr where launch.go's outputOwned keeps the last
+// probeStderrSampleBytes (32 KiB). A broken local CLI in a log loop could
+// exhaust daemon memory before any deadline helped.
+//
+// The two limits are deliberately different in kind, because the streams are:
+//
+//   - stderr is a diagnostic sample, so the *tail* is what matters — a CLI's
+//     actual failure line is at the end. Keeping the last 32 KiB matches
+//     outputOwned exactly, so moving a call site between the two mechanisms
+//     cannot change what a failed probe reports.
+//   - stdout is the answer, and silently dropping part of an answer is how a
+//     truncated catalog becomes a "successful" empty one. So it is capped and
+//     the overflow is reported as an error instead: a one-shot response that
+//     exceeds this is a malfunction, not a large answer.
+const collectStderrTail = probeStderrSampleBytes
+
+// A var, not a const, so a test can shrink it rather than generating megabytes to
+// reach it — the same reason detectVersionTimeout is one. Production never
+// reassigns it.
+var collectStdoutLimit = 8 << 20
 
 // outputBuffer accumulates one stream and records when the last write landed.
 //
@@ -48,15 +95,27 @@ const collectSettleGrace = 400 * time.Millisecond
 // new bytes together with a stale timestamp and conclude the stream had gone
 // quiet at the very moment it was producing — which for RunCollectQuiet means
 // truncating an answer mid-write.
+//
+// max bounds retention. keepTail selects which end survives: a tail buffer drops
+// from the front and keeps reading (stderr, a sample), while a head-capped
+// buffer stops accumulating and records the overflow so the caller can fail
+// rather than return a silently shortened answer (stdout).
 type outputBuffer struct {
 	mu        sync.Mutex
 	buf       []byte
 	lastWrite time.Time
+	max       int
+	keepTail  bool
+	overflow  bool
 }
 
 // absorb drains r into the buffer until EOF or the file is closed. Read errors
 // other than those are reported; a truncated stream is surfaced to the caller
 // as whatever arrived, matching the previous cmd.Output() behaviour.
+//
+// Reading continues past max in both modes. Stopping would leave the child
+// blocked in write() with a full pipe, which for a head-capped stream converts
+// "answer too large" into a hang.
 func (o *outputBuffer) absorb(r io.Reader) error {
 	chunk := make([]byte, 32*1024)
 	for {
@@ -64,8 +123,7 @@ func (o *outputBuffer) absorb(r io.Reader) error {
 		if n > 0 {
 			now := time.Now()
 			o.mu.Lock()
-			o.buf = append(o.buf, chunk[:n]...)
-			o.lastWrite = now
+			o.append(chunk[:n], now)
 			o.mu.Unlock()
 		}
 		if err != nil {
@@ -81,6 +139,42 @@ func (o *outputBuffer) snapshot() []byte {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]byte(nil), o.buf...)
+}
+
+// append records p under the caller's lock, honouring max. The timestamp is set
+// even when bytes are dropped: the stream was active, and an idle check that
+// concluded otherwise would be wrong.
+func (o *outputBuffer) append(p []byte, now time.Time) {
+	o.lastWrite = now
+	if o.max <= 0 {
+		o.buf = append(o.buf, p...)
+		return
+	}
+	if o.keepTail {
+		o.buf = append(o.buf, p...)
+		if len(o.buf) > o.max {
+			o.buf = append([]byte(nil), o.buf[len(o.buf)-o.max:]...)
+			o.overflow = true
+		}
+		return
+	}
+	room := o.max - len(o.buf)
+	if room <= 0 {
+		o.overflow = true
+		return
+	}
+	if len(p) > room {
+		p = p[:room]
+		o.overflow = true
+	}
+	o.buf = append(o.buf, p...)
+}
+
+// overflowed reports whether max caused anything to be dropped.
+func (o *outputBuffer) overflowed() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.overflow
 }
 
 // idleFor reports how long since the last write and whether anything has been
@@ -112,7 +206,14 @@ func (o *outputBuffer) idleFor() (time.Duration, bool) {
 // exec.ErrWaitDelay, so a CLI whose answer arrived and whose helper lingered is
 // reported as a failed call. On the OpenClaw paths that is not tolerable: a
 // failed `--version` skips runtime registration, and a failed `config file`
-// fails task preparation. See RunCollect for the rest of that comparison.
+// fails task preparation. See RunCollectQuiet for the guarantees this buys and
+// the one it cannot make.
+//
+// The corollary, learned the hard way: because this package decides when reading
+// is over, it must decide correctly. The direct child's exit is evidence about the
+// direct child only — a wrapper that exits while its descendant still owes the
+// answer is the normal shape on Windows — so awaitOutputAfterExit waits for pipe
+// EOF, bounded, unless the caller's rule says the answer is already in.
 type collector struct {
 	cmd        *exec.Cmd
 	outR, errR *os.File
@@ -186,6 +287,11 @@ func startCollector(cmd *exec.Cmd, env []string) (*collector, error) {
 		readers:  make(chan struct{}),
 		waitDone: make(chan struct{}),
 	}
+	// The answer is capped and reports overflow; the diagnostic keeps its tail.
+	// See collectStdoutLimit.
+	c.stdout.max = collectStdoutLimit
+	c.stderr.max = collectStderrTail
+	c.stderr.keepTail = true
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -215,7 +321,7 @@ func (c *collector) finish() {
 		// success path too: a successful `openclaw --version` still leaves its
 		// helper behind, which is how orphans accumulate on a host that probes
 		// on a timer. A helper that called setsid is out of reach here — see
-		// guarantee 2 on RunCollect — but this is also what releases the last
+		// guarantee 2 on RunCollectQuiet — but this is also what releases the last
 		// write end so the readers below can see EOF, which does not depend on
 		// the kill landing.
 		//
@@ -296,105 +402,46 @@ func (c *collector) exitErr() (error, bool) {
 	}
 }
 
-// RunCollect runs a short-lived CLI command to completion and returns its
-// stdout and stderr. It is the strongest of the three ways this package runs a
-// one-shot CLI, and the one to reach for when the answer must survive a CLI that
-// leaves a descendant holding stdout — see collector for why os/exec cannot be
-// bounded on that shape without also failing the call.
+// awaitOutputAfterExit waits, after the direct child has exited, for the output
+// this call is still owed.
 //
-// Against launch.go's outputOwned, which is what every other probe in this
-// package uses: both own the process tree, both kill it after the reap. The
-// difference is who owns the pipes. outputOwned hands os/exec a bytes.Buffer, so
-// Wait waits on pipe EOF and is bounded by probeWaitDelay, which expires into
-// exec.ErrWaitDelay — the answer is in the buffer and the call reports failure.
-// That is the right default for a probe whose CLI exits: it is a smaller
-// mechanism and it preserves the stdlib's contract exactly. It is the wrong one
-// where a lingering descendant is the normal case rather than the broken one,
-// which on the OpenClaw paths it measurably is.
+// The distinction it enforces is the one an earlier revision of this branch got
+// wrong: the leader exiting means *the leader* is done, not that output is done.
+// A wrapper can exit 0 while the real CLI, which inherited its stdout, has not
+// printed yet. Only pipe EOF means every write end is closed and no more output
+// is coming, so that is what this waits for — bounded by collectDrainGrace, since
+// a descendant that never closes the pipe must not hold the call forever.
 //
-// #6084 measured that shape (a shim whose backgrounded child slept 6s took
-// 6.01s against a 150ms deadline) and reverted a cmd.WaitDelay backstop on
-// review, because WaitDelay bounds the call only by leaving the descendant
-// running and reports exec.ErrWaitDelay — turning a probe whose output arrived
-// perfectly fine into a failure. The gap was tracked as MUL-5467; this closes
-// it by owning the pipes and the process group instead.
+// complete short-circuits the wait: once the answer is in the buffer there is
+// nothing left to owe, so a CLI that prints and exits pays nothing here even when
+// it leaves a helper on the pipe. With a nil rule there is no way to recognise the
+// answer, so EOF or the bound are the only stopping conditions.
 //
-// Guarantees callers depend on:
-//
-//  1. Returns within roughly the caller's context deadline plus
-//     collectReapWindow and collectSettleGrace, whatever the CLI leaves behind.
-//
-//  2. Descendants that are still in the leader's process group are signalled
-//     before returning, and the signal is repeated across collectReapWindow so
-//     one that was mid-fork does not escape.
-//
-//     A descendant that left the group cannot be reached this way, and OpenClaw's
-//     helper is exactly that: measured on a real host, `openclaw-config` holds the
-//     same stdout pipe as its parent (both `pipe:[135202]`) but runs with its own
-//     PGID and SID. `kill(-pgid)` never reaches it, and neither does #7531's
-//     ownership, which uses the same group. What holds regardless is guarantee 1 —
-//     that is the point of owning the pipes rather than relying on the kill. On
-//     that host the helper exited with its parent, so no orphan accumulated; on a
-//     build where it outlives the parent, it would, and this layer cannot prevent
-//     that. Windows is different: the Job Object owns the tree irrespective of
-//     groups, so the assignment in startOwnedProcessTree does reach a descendant
-//     that would escape here.
-//
-//  3. Whenever the tree is reaped successfully — which is every case the OS lets
-//     us have — the reader goroutines and cmd.Wait have all returned before this
-//     call does. If the kill does not take, the residue is logged and the answer
-//     is still returned: a goroutine can stay parked reading a pipe a surviving
-//     descendant holds, and that is not removable from here. It is deliberately
-//     not reported as a call failure — see finish().
-//
-//  4. The command's real exit status is reported, which openclawShimDiagnostic
-//     depends on (it type-switches on *exec.ExitError).
-//
-// env, when non-nil, replaces the child's environment (os/exec semantics).
-//
-// Not for agent execution: those paths stream stdout incrementally and manage
-// their own lifecycle. Use this for one-shot, read-only invocations
-// (`--version`, `agents list`, `config get`).
-//
-// This path-taking form has no production caller yet — the three call sites this
-// change converts already hold a *exec.Cmd and use RunCollectCmd. It exists for
-// a caller that only has a path, and as the entry point should another probe turn
-// out to need pipe ownership rather than the probeWaitDelay bound outputOwned
-// gives it (#7531 moved the rest of this package's one-shot probes onto that).
-func RunCollect(ctx context.Context, env []string, execPath string, args ...string) (stdout []byte, stderr string, err error) {
-	// Command.exec, not exec.CommandContext: launch.go owns process construction
-	// so a custom runtime's fixed_args prefix cannot be dropped (GH #7046). A zero
-	// Command has no prefix, which is what a bare path argument means here.
-	return RunCollectCmd(ctx, Command{Path: execPath}.exec(ctx, args...), env)
-}
-
-// RunCollectCmd is RunCollect for a caller that already holds a *exec.Cmd, which
-// is what Command.exec returns.
-//
-// ctx bounds the call on its own: it is not assumed that cmd was built with
-// exec.CommandContext. RunCollect's own cmd is, but a caller passing a plain
-// exec.Command would otherwise block here for as long as the CLI chose to run,
-// with the ctx argument doing nothing.
-func RunCollectCmd(ctx context.Context, cmd *exec.Cmd, env []string) (stdout []byte, stderr string, err error) {
-	c, startErr := startCollector(cmd, env)
-	if startErr != nil {
-		return nil, "", startErr
+// Note it does *not* additionally require the buffer to have gone idle. Idleness
+// is a proxy for "the writer stopped", and the leader's exit is direct evidence
+// of that; demanding both would charge every well-behaved call an idle grace it
+// has already earned.
+func (c *collector) awaitOutputAfterExit(ctx context.Context, complete OutputComplete) {
+	if complete != nil && complete(c.stdout.snapshot()) {
+		return
 	}
-	select {
-	case <-c.waitDone:
-		c.finish()
-		return c.stdout.snapshot(), string(c.stderr.snapshot()), c.waitErr
-	case <-ctx.Done():
-		// Same ordering as RunCollectQuietCmd's deadline branch, so the two
-		// entry points cannot hand callers different error shapes for the same
-		// situation: prefer the process error once the tree has been reaped —
-		// "signal: killed" is worth keeping — and fall back to ctx.Err().
-		c.finish()
-		out := c.stdout.snapshot()
-		if werr, reaped := c.exitErr(); reaped && werr != nil {
-			return out, string(c.stderr.snapshot()), werr
+	deadline := time.Now().Add(collectDrainGrace)
+	ticker := time.NewTicker(quietPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.readers:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if complete != nil && complete(c.stdout.snapshot()) {
+				return
+			}
+			if time.Now().After(deadline) {
+				return
+			}
 		}
-		return out, string(c.stderr.snapshot()), ctx.Err()
 	}
 }
 

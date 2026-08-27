@@ -61,18 +61,26 @@ const openclawUserSnapshotFile = "openclaw-user-snapshot.json"
 // trading a hang for a process leak, and on Unix nothing reaped it because
 // preparationProcessController.finish() is a no-op there.
 //
-// execOpenclawCLI now goes through agent.RunCollectQuiet, which owns the pipes
-// (so Wait returns when the direct child exits, whatever a descendant is holding)
-// and owns the process tree (Unix process group, Windows Job Object), so a
-// descendant that stayed in that tree is reaped rather than orphaned. The
-// deadline below is therefore enforceable, and a host that needs more of it can
-// say so through the override rather than discovering that the limit was
-// advisory.
+// execOpenclawCLI goes through agent.RunCollectQuiet, which owns the pipes and
+// the process tree (Unix process group, Windows Job Object). Owning the pipes is
+// what makes the deadline enforceable: os/exec's own Wait cannot return while a
+// descendant holds an output pipe, so the bound has to come from somewhere else,
+// and a caller-side bound that reports failure would fail a call whose answer
+// arrived. Owning the tree is what stops the descendant becoming an orphan.
 //
-// Enforceable is the claim, not "nothing survives": `openclaw-config` was
-// measured with its own PGID and SID, so on Unix no group signal reaches it. The
-// deadline holds anyway, because it is pipe ownership rather than the kill that
-// makes Wait return — see guarantee 2 on agent.RunCollect.
+// Two limits on that claim, both deliberate:
+//
+//   - "Enforceable", not "nothing survives": `openclaw-config` was measured with
+//     its own PGID and SID, so on Unix no group signal reaches it. The deadline
+//     holds anyway, because it is pipe ownership rather than the kill that makes
+//     the call return.
+//   - Returning before the CLI exits requires a completeness rule that the CLI's
+//     pre-answer output cannot satisfy, which in practice means `--json` (see
+//     openclawOutputComplete). Without one — `config file` as the fallback — this
+//     deadline is what the call is bounded by, and reaching it is a failure. That
+//     is a deliberate trade: an earlier revision judged `config file`'s stdout by
+//     shape and review showed it returning a path-shaped *warning* line as the
+//     answer.
 const openclawCLITimeout = 30 * time.Second
 
 // OpenclawCLITimeoutEnv overrides openclawCLITimeout. Accepts a Go duration
@@ -655,21 +663,47 @@ func stripUserMcpServers(resolved map[string]any) {
 	}
 }
 
-// openclawActiveConfigPath runs `openclaw config file` to discover the path
-// the openclaw CLI considers active. Returns (absolutePath, exists, error).
+// openclawActiveConfigPath discovers the path the openclaw CLI considers active.
+// Returns (absolutePath, exists, error).
 //
 // The CLI handles the full resolution chain — explicit config path, state
 // directory, OPENCLAW_HOME / default home, legacy locations, migration, and `~`
 // expansion — so we prefer it when the installed CLI supports the command.
+//
+// `config validate --json` is asked first, and `config file` is only the
+// fallback, because the two differ in whether the answer can be recognised:
+//
+//   - `config validate --json` puts the path in a named `path` field of a JSON
+//     document. Nothing else can be mistaken for it, and because argv carries
+//     `--json`, upstream routes incidental console output to stderr
+//     (`withConsoleLogsRoutedToStderrForJson`), so stdout is the document alone.
+//   - `config file` prints the path as its *last line*, after any Doctor and
+//     plugin warnings, on stdout. Deciding "is the answer in yet" then means
+//     asking whether the last line looks like a path — and a warning line that
+//     names one is indistinguishable. Review demonstrated it: a stub printing an
+//     existing `plugin-cache.json` path, then pausing, then printing the real
+//     path had the warning accepted as the answer.
+//
+// Both commands perform the same `readConfigFileSnapshot()` read upstream
+// (checked at `v2026.7.1`: `runConfigFile` prints `shortenHomePath(snapshot.path)`
+// and `runConfigValidate` reports `snapshot.path`, `snapshot.exists` and
+// `snapshot.valid` from that same snapshot), so preferring the JSON form costs
+// nothing extra — validation is already part of the read `config file` does.
+// `config validate --json` has carried the `path` field on every branch since
+// `v2026.5.5`, which is minOpenclawVersion.
 //
 // OpenClaw 2026.2.x briefly rejected `openclaw config file` with the generic
 // "too many arguments for 'config'" error. For that command-shape failure only,
 // fall back to the same active-config candidate shape so task prep can still
 // continue without losing upgraded users' legacy config files.
 //
-// The reported path uses `~` shorthand for the user's home; we expand it
-// so the $include reference we write is unambiguous absolute.
+// A reported path may use `~` or `$OPENCLAW_HOME` shorthand; we expand it so the
+// $include reference we write is unambiguously absolute.
 func openclawActiveConfigPath(bin string, timeout time.Duration) (string, bool, error) {
+	if path, ok := openclawValidatedConfigPath(bin, timeout); ok {
+		return openclawStatConfigPath(path)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	out, err := openclawExec(ctx, bin, "config", "file")
@@ -684,6 +718,62 @@ func openclawActiveConfigPath(bin string, timeout time.Duration) (string, bool, 
 		return "", false, err
 	}
 	return openclawParseActiveConfigPath(out)
+}
+
+// openclawValidatedConfigPath asks `openclaw config validate --json` for the
+// active config path, and reports whether the answer was unambiguous.
+//
+// The exit status is deliberately not consulted: upstream exits 1 both for a
+// missing config file and for an invalid one, and carries the path in the payload
+// either way (`{"valid":false,"path":"…","error":"file not found"}`). Whether the
+// user's config parses is not this function's question — prepareOpenclawConfig
+// needs to know *where* it is, and a fresh install with no file at all is a
+// normal, expected answer.
+//
+// Failure is silent by design: every failure mode here is a reason to ask
+// `config file` instead, and reporting one would turn "this CLI answered in a
+// shape we do not understand" into a task failure. The only requirement is that
+// the path be absolute after expansion, which is what distinguishes a real answer
+// from the `CONFIG_PATH ?? "openclaw.json"` fallback upstream prints when it
+// throws before reading the snapshot.
+func openclawValidatedConfigPath(bin string, timeout time.Duration) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, _ := openclawExec(ctx, bin, "config", "validate", "--json")
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" {
+		return "", false
+	}
+	var payload struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		return "", false
+	}
+	reported := strings.TrimSpace(payload.Path)
+	if reported == "" {
+		return "", false
+	}
+	// The reported value must already name an absolute location, before any
+	// expansion. Upstream prints `CONFIG_PATH ?? "openclaw.json"` when it throws
+	// before reading the snapshot, and expandOpenclawPath would turn that bare
+	// relative literal into a confident `<daemon cwd>/openclaw.json` — the #6630
+	// failure shape, arrived at from a different direction. The `~` and
+	// `$OPENCLAW_HOME` forms are absolute once resolved, so they are allowed
+	// through; anything else relative is not an answer, and `config file` gets
+	// asked instead.
+	if !filepath.IsAbs(reported) {
+		_, isTilde := openclawTildeRest(reported)
+		_, isHome := openclawHomeRest(reported)
+		if !isTilde && !isHome {
+			return "", false
+		}
+	}
+	expanded, err := expandOpenclawPath(reported)
+	if err != nil || !filepath.IsAbs(expanded) {
+		return "", false
+	}
+	return expanded, true
 }
 
 func openclawParseActiveConfigPath(out string) (string, bool, error) {
@@ -1109,8 +1199,8 @@ func openclawRegistryAgentsList(bin string, timeout time.Duration) ([]any, error
 var openclawExec = execOpenclawCLI
 
 // openclawLastNonEmptyLine returns the last non-empty, trimmed line of out.
-// Shared by the parser and by openclawConfigPathComplete so the two cannot
-// disagree about which line carries the answer.
+// Used by openclawParseActiveConfigPath for the `config file` fallback, where the
+// path is the last line the CLI prints.
 func openclawLastNonEmptyLine(out string) string {
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -1121,97 +1211,38 @@ func openclawLastNonEmptyLine(out string) string {
 	return ""
 }
 
-// openclawConfigPathComplete reports whether out already carries a usable
-// `openclaw config file` answer, i.e. its last non-empty line looks like a path.
-//
-// Deliberately stricter than the parser, which resolves a relative line through
-// filepath.Abs and would therefore accept a Doctor warning border as an answer.
-// That leniency is fine once the command has finished; as a completeness rule it
-// would let the early return fire on the banner OpenClaw prints *before* the
-// path. Measured on 2026.5.27: the banner lands 54ms ahead of the path.
-//
-// The `$OPENCLAW_HOME\...` form counts as an answer once that variable resolves
-// to an absolute directory, which is the hand-off #7310 left here: while the
-// parser could not expand the shape, accepting it would have handed the caller a
-// path the parser then failed on, so this rule had to refuse it and such a host
-// lost the early return. #7310 made expandOpenclawPath understand it, so the
-// refusal is now the only thing standing between those hosts and the hang
-// tolerance the rest of this change exists for.
-//
-// Resolved through openclawHomeFromEnv rather than read raw from the
-// environment, because the value itself may be a tilde path that upstream
-// expands before printing (see there). Judging `~/svc` by filepath.IsAbs on the
-// raw string answers false and silently withholds the early return on exactly
-// the configuration #7310's review was about.
-func openclawConfigPathComplete(out []byte) bool {
-	line := openclawLastNonEmptyLine(string(out))
-	if line == "" {
-		return false
-	}
-	if _, isTilde := openclawTildeRest(line); isTilde {
-		return true
-	}
-	if _, isOpenclawHome := openclawHomeRest(line); isOpenclawHome {
-		home, err := openclawHomeFromEnv()
-		return err == nil && filepath.IsAbs(home)
-	}
-	return filepath.IsAbs(line)
-}
-
-// openclawQuietIdleGrace is how long stdout must stay silent, on top of already
-// carrying a complete answer, before the early return fires for this subcommand.
-//
-// Zero means agent.DefaultQuietIdleGrace, which is right for every `--json`
-// command: upstream routes incidental console output to stderr when argv carries
-// `--json` (`withConsoleLogsRoutedToStderrForJson`, `src/cli/json-output-mode.ts`
-// at `v2026.7.1`), so their stdout is the JSON document and nothing else. A
-// partial document does not parse, so no gap in the middle of one can produce a
-// wrong early return however long it lasts.
-//
-// `config file` has no `--json`, so that routing does not apply and the Doctor and
-// plugin warnings land on *stdout*, ahead of the path. Measured on a real host
-// with a warning-producing config: the whole response spans 3289ms, of which a
-// single 3285ms gap sits between the end of the Doctor block and the path. With
-// the default grace, the early return is eligible to fire inside that gap, on
-// whatever the warnings left in the buffer.
-//
-// openclawConfigPathComplete is what makes that safe, and it is the guarantee
-// here — a grace can only ever be defence in depth, since the gap is a property
-// of the host's plugin and Doctor work and no fixed value provably exceeds it.
-// This one is sized above the measured gap so a rule that turns out to accept
-// some warning line still has to lose a race it would previously have won by
-// three seconds. The cost is paid only by a CLI that hangs: `config file` then
-// returns in path + this, instead of path + 400ms, against a 30s deadline.
-func openclawQuietIdleGrace(args []string) time.Duration {
-	for _, a := range args {
-		if a == "--json" {
-			return 0
-		}
-	}
-	if len(args) >= 2 && args[0] == "config" && args[1] == "file" {
-		return openclawConfigFileIdleGrace
-	}
-	return 0
-}
-
-const openclawConfigFileIdleGrace = 5 * time.Second
-
 // openclawOutputComplete returns the rule that decides whether the bytes
 // captured so far are a finished answer for this openclaw subcommand, for
 // agent.RunCollectQuiet's early return.
 //
+// Only `--json` commands get one, and that is the whole design rather than a gap
+// to fill in later. Two properties make a JSON answer recognisable, and neither
+// has an equivalent for human-readable output:
+//
+//   - The document has to parse *as a whole*, so a response still being written
+//     cannot satisfy the rule, no matter how long the writer pauses mid-way.
+//   - Upstream routes incidental console output to stderr whenever argv carries
+//     `--json` (`withConsoleLogsRoutedToStderrForJson`, `src/cli/json-output-mode.ts`
+//     at `v2026.7.1`), so stdout carries the answer and nothing else. Without
+//     `--json`, Doctor and plugin warnings share stdout with the answer.
+//
+// An earlier revision of this branch also had a rule for `config file`: accept
+// the buffer once its last non-empty line looks like a path. Review broke it with
+// a stub that prints an existing `plugin-cache.json` path, pauses past any fixed
+// grace, and then prints the real path — the warning was returned as the answer.
+// That is not fixable by waiting longer, because the pause is the host's plugin
+// and Doctor work and has no bound; it is fixable by not asking a question that
+// content cannot answer. openclawActiveConfigPath now prefers
+// `config validate --json`, whose path arrives in a named field.
+//
 // A nil result means "no rule for this shape", which makes RunCollectQuiet wait
-// for the process to exit — the conservative behaviour. Adding a subcommand
-// without a rule therefore loses the hang tolerance rather than risking a
-// truncated answer.
+// for the process to exit — the conservative behaviour, and what `config file`
+// now gets when it is used as the fallback.
 func openclawOutputComplete(args []string) agent.OutputComplete {
 	for _, a := range args {
 		if a == "--json" {
 			return agent.JSONOutputComplete
 		}
-	}
-	if len(args) >= 2 && args[0] == "config" && args[1] == "file" {
-		return openclawConfigPathComplete
 	}
 	return nil
 }
@@ -1257,7 +1288,7 @@ func execOpenclawCLI(ctx context.Context, bin string, args ...string) (string, e
 	// alongside the error: annotateOpenclawJSONError reads it, and the typed
 	// timeout sentinel is what lets the daemon classify a local stall
 	// structurally.
-	raw, stderrOut, _, err := agent.RunCollectQuiet(ctx, os.Environ(), openclawQuietIdleGrace(args), openclawOutputComplete(args), bin, args...)
+	raw, stderrOut, _, err := agent.RunCollectQuiet(ctx, os.Environ(), 0, openclawOutputComplete(args), bin, args...)
 	stdout := string(raw)
 	if err != nil {
 		stderrMsg := strings.TrimSpace(stderrOut)

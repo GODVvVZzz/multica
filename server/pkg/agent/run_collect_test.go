@@ -149,7 +149,7 @@ func TestRunCollectReturnsDespitePipeHoldingGrandchild(t *testing.T) {
 	cli := writeForkingCLI(t, pidFile)
 
 	start := time.Now()
-	out, _, err := RunCollect(context.Background(), nil, cli)
+	out, _, _, err := RunCollectQuiet(context.Background(), nil, 0, nil, cli)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -172,7 +172,7 @@ func TestRunCollectReapsForkedHelper(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "helper.pid")
 	cli := writeForkingCLI(t, pidFile)
 
-	if _, _, err := RunCollect(context.Background(), nil, cli); err != nil {
+	if _, _, _, err := RunCollectQuiet(context.Background(), nil, 0, nil, cli); err != nil {
 		t.Fatalf("RunCollect returned an error: %v", err)
 	}
 
@@ -195,7 +195,7 @@ func TestRunCollectSurfacesStderrAndExitStatus(t *testing.T) {
 		t.Fatalf("write cli: %v", err)
 	}
 
-	_, stderr, err := RunCollect(context.Background(), nil, cli)
+	_, stderr, _, err := RunCollectQuiet(context.Background(), nil, 0, nil, cli)
 	if err == nil {
 		t.Fatal("expected an error for exit status 7")
 	}
@@ -236,7 +236,7 @@ func TestRunCollectRetriesTheTreeKill(t *testing.T) {
 	}
 	t.Cleanup(func() { reapKill = original })
 
-	out, _, err := RunCollect(context.Background(), nil, cli)
+	out, _, _, err := RunCollectQuiet(context.Background(), nil, 0, nil, cli)
 	if err != nil {
 		t.Fatalf("RunCollect returned an error: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestRunCollectCmdHonorsContextWithoutACommandContext(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, _, err := RunCollectCmd(ctx, exec.Command(cli), nil)
+	_, _, _, err := RunCollectQuietCmd(ctx, exec.Command(cli), nil, 0, nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -350,13 +350,13 @@ func TestRunCollectLeavesNoGoroutines(t *testing.T) {
 	cli := writeForkingCLI(t, pidFile)
 
 	// Warm up so lazily-created runtime goroutines exist before the baseline.
-	if _, _, err := RunCollect(context.Background(), nil, cli); err != nil {
+	if _, _, _, err := RunCollectQuiet(context.Background(), nil, 0, nil, cli); err != nil {
 		t.Fatalf("warmup: %v", err)
 	}
 	before := runtime.NumGoroutine()
 
 	for i := 0; i < 2; i++ {
-		if _, _, err := RunCollect(context.Background(), nil, cli); err != nil {
+		if _, _, _, err := RunCollectQuiet(context.Background(), nil, 0, nil, cli); err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}
 	}

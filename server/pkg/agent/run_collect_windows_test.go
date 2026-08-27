@@ -80,13 +80,13 @@ func TestWindowsRunCollectQuietCutsShortAndLeavesNoGoroutines(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	if _, _, _, err := RunCollectQuiet(ctx, nil, 0, JSONOutputComplete, shim); err != nil {
+	if _, _, _, _, err := RunCollectQuiet(ctx, nil, 0, JSONOutputComplete, shim); err != nil {
 		t.Fatalf("warmup: %v", err)
 	}
 	before := runtime.NumGoroutine()
 
 	start := time.Now()
-	out, _, quiet, err := RunCollectQuiet(ctx, nil, 0, JSONOutputComplete, shim)
+	out, _, quiet, _, err := RunCollectQuiet(ctx, nil, 0, JSONOutputComplete, shim)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -130,7 +130,7 @@ func TestWindowsRunCollectQuietDoesNotSalvagePartialOutput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	out, _, _, err := RunCollectQuiet(ctx, nil, 0, JSONOutputComplete, shim)
+	out, _, _, _, err := RunCollectQuiet(ctx, nil, 0, JSONOutputComplete, shim)
 	if err == nil {
 		t.Fatalf("partial output reported as success (%d bytes) — an interrupted "+
 			"response must never be handed to a caller as a finished one", len(out))
@@ -146,12 +146,12 @@ func TestWindowsRunCollectReturnsAndLeavesNoGoroutines(t *testing.T) {
 		t.Fatalf("write shim: %v", err)
 	}
 
-	if _, _, err := RunCollect(context.Background(), nil, shim); err != nil {
+	if _, _, _, err := RunCollectQuiet(context.Background(), nil, 0, nil, shim); err != nil {
 		t.Fatalf("warmup: %v", err)
 	}
 	before := runtime.NumGoroutine()
 
-	out, _, err := RunCollect(context.Background(), nil, shim)
+	out, _, _, err := RunCollectQuiet(context.Background(), nil, 0, nil, shim)
 	if err != nil {
 		t.Fatalf("RunCollect: %v", err)
 	}
@@ -194,7 +194,7 @@ func main() {
 	}
 
 	env := append(os.Environ(), "DESCENDANT_PID_FILE="+pidPath)
-	out, _, err := RunCollect(context.Background(), env, exePath)
+	out, _, _, err := RunCollectQuiet(context.Background(), env, 0, nil, exePath)
 	if err != nil {
 		t.Fatalf("RunCollect: %v", err)
 	}

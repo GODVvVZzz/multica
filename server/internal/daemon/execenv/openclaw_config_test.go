@@ -50,11 +50,49 @@ func installOpenclawStub(t *testing.T, responses map[string]openclawResponse) *o
 func (s *openclawCLIStub) exec(_ context.Context, bin string, args ...string) (string, error) {
 	s.calls = append(s.calls, openclawCall{bin: bin, args: append([]string(nil), args...)})
 	key := strings.Join(args, " ")
-	resp, ok := s.responses[key]
-	if !ok {
-		return "", fmt.Errorf("openclawCLIStub: unexpected args %q", key)
+	if resp, ok := s.responses[key]; ok {
+		return resp.stdout, resp.err
 	}
-	return resp.stdout, resp.err
+	if key == "config validate --json" {
+		return s.derivedValidateResponse()
+	}
+	return "", fmt.Errorf("openclawCLIStub: unexpected args %q", key)
+}
+
+// derivedValidateResponse answers `config validate --json` from the registered
+// `config file` response when a test did not register one itself.
+//
+// openclawActiveConfigPath asks `config validate --json` first because its answer
+// arrives in a named field (see there). Almost every test in this package fixes
+// the *outcome* of path resolution — which file the wrapper $includes, how many
+// CLI calls a cold preparation makes, what happens when the CLI is missing — and
+// not which subcommand supplies it. Deriving keeps those tests stating what they
+// are about; hand-writing a second response into 30-odd maps would turn the next
+// change to this boundary into a 30-site edit and bury the two tests that do care.
+//
+// A test that cares registers "config validate --json" explicitly:
+// TestOpenclawActiveConfigPathIgnoresAPathShapedWarning and the fallback cases in
+// openclaw_process_tree_test.go drive the real binary instead, so they are
+// unaffected by this.
+func (s *openclawCLIStub) derivedValidateResponse() (string, error) {
+	resp, ok := s.responses["config file"]
+	if !ok {
+		return "", fmt.Errorf("openclawCLIStub: no `config file` response to derive validate from")
+	}
+	// An unusable `config file` means an unusable CLI for this purpose: report the
+	// same failure so the test exercises whatever fallback it is about.
+	if resp.err != nil {
+		return "", resp.err
+	}
+	path := strings.TrimSpace(resp.stdout)
+	if path == "" {
+		return "", nil
+	}
+	payload, err := json.Marshal(map[string]any{"valid": true, "path": path})
+	if err != nil {
+		return "", err
+	}
+	return string(payload) + "\n", nil
 }
 
 func mustReadJSON(t *testing.T, path string) map[string]any {
@@ -246,11 +284,23 @@ func TestPrepareOpenclawConfigFallsBackWhenConfigFileUnsupported(t *testing.T) {
 	if len(list) != 1 || list[0].(map[string]any)["workspace"] != workDir {
 		t.Errorf("agents.list workspace rewrite after fallback = %v, want workDir %q", list, workDir)
 	}
-	if len(stub.calls) != 2 {
-		t.Fatalf("openclaw calls = %d, want 2: %+v", len(stub.calls), stub.calls)
+	// Three calls, not two, and the extra one is the point of this test now: a CLI
+	// too old to support `config file` is also too old for `config validate --json`,
+	// so path resolution asks both before falling back to the candidate shape. That
+	// is one extra invocation on exactly the hosts that were already on a
+	// deprecated command shape, and it buys every current host an answer that a
+	// path-shaped warning line cannot corrupt (see openclawActiveConfigPath).
+	if len(stub.calls) != 3 {
+		t.Fatalf("openclaw calls = %d, want 3: %+v", len(stub.calls), stub.calls)
 	}
-	if strings.Join(stub.calls[1].args, " ") != "config get agents.list --json" {
-		t.Errorf("second openclaw call = %q, want config get agents.list --json", strings.Join(stub.calls[1].args, " "))
+	if got := strings.Join(stub.calls[0].args, " "); got != "config validate --json" {
+		t.Errorf("first openclaw call = %q, want config validate --json", got)
+	}
+	if got := strings.Join(stub.calls[1].args, " "); got != "config file" {
+		t.Errorf("second openclaw call = %q, want config file", got)
+	}
+	if strings.Join(stub.calls[2].args, " ") != "config get agents.list --json" {
+		t.Errorf("third openclaw call = %q, want config get agents.list --json", strings.Join(stub.calls[2].args, " "))
 	}
 }
 

@@ -123,61 +123,6 @@ func TestExecOpenclawCLIReapsForkedHelper(t *testing.T) {
 	}
 }
 
-// TestExecOpenclawCLIWaitsForThePathAfterDoctorBanner is the regression for the
-// review finding on #6275: "output arrived and went quiet" is not the same as
-// "the answer arrived".
-//
-// `openclaw config file` can print Doctor warning UI before the path (MUL-3136,
-// which is why openclawParseActiveConfigPath takes the last non-empty line). If
-// the early return fired on idle output alone, a pause between the banner and the
-// path would hand the banner back as the config path — and expandOpenclawPath
-// would dutifully turn it into an absolute path, so nothing downstream would
-// catch it.
-func TestExecOpenclawCLIWaitsForThePathAfterDoctorBanner(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "openclaw")
-	// A real, statable path rather than the literal path the host printed:
-	// openclawParseActiveConfigPath stats what it parses and tolerates only
-	// os.ErrNotExist, so a hard-coded /root/... path reads as ENOENT on a
-	// developer machine but as EACCES on a Linux CI runner — failing the test for
-	// a reason that has nothing to do with the boundary under test.
-	cfgPath := filepath.Join(dir, "openclaw.json")
-	if err := os.WriteFile(cfgPath, []byte("{}\n"), 0o644); err != nil {
-		t.Fatalf("write fake config: %v", err)
-	}
-	body := "#!/bin/sh\n" +
-		"echo '┌───────────────────────────────┐'\n" +
-		"echo '│ warning: run openclaw doctor  │'\n" +
-		"echo '└───────────────────────────────┘'\n" +
-		"sleep 1\n" +
-		"printf '%s\\n' '" + cfgPath + "'\n" +
-		"sleep 300\n"
-	if err := os.WriteFile(bin, []byte(body), 0o755); err != nil {
-		t.Fatalf("write fake openclaw: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	out, err := execOpenclawCLI(ctx, bin, "config", "file")
-	if err != nil {
-		t.Fatalf("execOpenclawCLI: %v", err)
-	}
-	got := strings.TrimSpace(out)
-	if !strings.HasSuffix(got, cfgPath) {
-		t.Fatalf("output = %q — returned before the path arrived, so the Doctor "+
-			"banner would be parsed as the config path", got)
-	}
-	// And the parse the daemon actually performs must land on the path.
-	path, _, perr := openclawParseActiveConfigPath(out)
-	if perr != nil {
-		t.Fatalf("openclawParseActiveConfigPath: %v", perr)
-	}
-	if path != cfgPath {
-		t.Errorf("parsed path = %q, want the real config path", path)
-	}
-}
-
 // TestExecOpenclawCLIDoesNotSalvagePartialJSON pins that a `--json` subcommand
 // still streaming when the deadline arrives is an error, not a truncated success.
 func TestExecOpenclawCLIDoesNotSalvagePartialJSON(t *testing.T) {
@@ -202,23 +147,16 @@ func TestExecOpenclawCLIDoesNotSalvagePartialJSON(t *testing.T) {
 }
 
 // TestOpenclawOutputCompleteRules pins which rule each subcommand shape gets, and
-// that an unknown shape gets none — which makes RunCollectQuiet wait for exit
+// that everything else gets none — which makes RunCollectQuiet wait for exit
 // rather than guess.
 func TestOpenclawOutputCompleteRules(t *testing.T) {
 	banner := []byte("┌────┐\n│ hi │\n└────┘\n")
-	pathOut := []byte(string(banner) + "/root/.openclaw/openclaw.json\n")
 	partialJSON := []byte(`{"agents":[{"id":"a"},`)
 	fullJSON := []byte("{\"agents\":[]}\n")
 
-	// `config file` prints the path with the $HOME prefix collapsed, so the shape
-	// depends on the environment rather than on where the file is: the same file was
-	// reported as `~/.openclaw/openclaw.json` under one HOME and as
-	// `/root/.openclaw/openclaw.json` under another (openclaw 2026.5.27). The daemon
-	// normally shares openclaw's HOME, so the tilde form is the common one.
-	//
-	// With OPENCLAW_HOME set, upstream prints that variable's name instead (see
-	// openclawHomeRest), so whether such a line is a finished answer depends on the
-	// environment too — env carries the value under test for those rows.
+	// Only `--json` shapes get a rule. A JSON document has to parse as a whole, so
+	// no pause mid-write can be mistaken for a finished answer, and upstream keeps
+	// incidental output off a `--json` stdout entirely.
 	cases := []struct {
 		name string
 		env  map[string]string
@@ -226,40 +164,8 @@ func TestOpenclawOutputCompleteRules(t *testing.T) {
 		out  []byte
 		want bool
 	}{
-		{name: "config file, banner only", args: []string{"config", "file"}, out: banner, want: false},
-		{name: "config file, path arrived", args: []string{"config", "file"}, out: pathOut, want: true},
-		{name: "config file, tilde path", args: []string{"config", "file"}, out: []byte("~/.openclaw/openclaw.json\n"), want: true},
-		{name: "config file, Windows tilde path", args: []string{"config", "file"}, out: []byte("~\\.openclaw\\openclaw.json\r\n"), want: true},
-		// The hand-off from #7310: the parser understands this shape now, so the
-		// rule may accept it and these hosts get the early return.
-		{
-			name: "config file, OPENCLAW_HOME path",
-			env:  map[string]string{"OPENCLAW_HOME": string(filepath.Separator) + "srv" + string(filepath.Separator) + "openclaw"},
-			args: []string{"config", "file"},
-			out:  []byte("$OPENCLAW_HOME\\.openclaw\\openclaw.json\r\n"),
-			want: true,
-		},
-		// A tilde-valued OPENCLAW_HOME resolves to an absolute directory, so the
-		// answer is finished. Judging the raw value with filepath.IsAbs would say
-		// false here and withhold the early return on exactly the configuration
-		// #7310's review was about.
-		{
-			name: "config file, tilde-valued OPENCLAW_HOME",
-			env:  map[string]string{"OPENCLAW_HOME": "~/svc"},
-			args: []string{"config", "file"},
-			out:  []byte("$OPENCLAW_HOME/.openclaw/openclaw.json\n"),
-			want: true,
-		},
-		// Nothing to resolve it to: not an answer, so the call waits for exit and
-		// the parser reports the real error rather than this rule guessing.
-		{
-			name: "config file, OPENCLAW_HOME unset",
-			env:  map[string]string{"OPENCLAW_HOME": ""},
-			args: []string{"config", "file"},
-			out:  []byte("$OPENCLAW_HOME/.openclaw/openclaw.json\n"),
-			want: false,
-		},
-		{name: "config file, empty", args: []string{"config", "file"}, out: nil, want: false},
+		{name: "json, banner before the document never parses", args: []string{"config", "validate", "--json"}, out: append(append([]byte{}, banner...), fullJSON...), want: false},
+		{name: "json, validate payload", args: []string{"config", "validate", "--json"}, out: []byte(`{"valid":true,"path":"/home/u/.openclaw/openclaw.json"}`), want: true},
 		{name: "json, partial", args: []string{"config", "get", "--json"}, out: partialJSON, want: false},
 		{name: "json, complete", args: []string{"config", "get", "--json"}, out: fullJSON, want: true},
 		{name: "json, null is a real answer", args: []string{"config", "get", "agents.list", "--json"}, out: []byte("null\n"), want: true},
@@ -280,120 +186,44 @@ func TestOpenclawOutputCompleteRules(t *testing.T) {
 		})
 	}
 
-	if rule := openclawOutputComplete([]string{"doctor"}); rule != nil {
-		t.Error("an unrecognised subcommand must have no rule, so the runner " +
-			"waits for exit instead of judging output it does not understand")
-	}
-}
-
-// TestOpenclawQuietIdleGraceCoversTheWarningGap pins the grace each subcommand
-// shape gets.
-//
-// Measured on a real host: with a config that produces Doctor and plugin
-// warnings, `openclaw config file` spread its stdout over 3289ms, of which one
-// 3285ms silence sat between the end of the warning block and the path. So the
-// gap that matters is not the one *inside* an answer — those writes are
-// microseconds apart — but the one between non-answer output and the answer, and
-// the default 400ms sits well inside it.
-//
-// `--json` commands are exempt because upstream routes incidental console output
-// to stderr when argv carries `--json`, so their stdout cannot contain a
-// non-answer prefix to strand a rule on in the first place.
-func TestOpenclawQuietIdleGraceCoversTheWarningGap(t *testing.T) {
-	const measuredWarningGap = 3285 * time.Millisecond
-
-	for _, tc := range []struct {
-		name string
-		args []string
-		want time.Duration
-	}{
-		{"config file gets more than the measured gap", []string{"config", "file"}, openclawConfigFileIdleGrace},
-		{"json keeps the default", []string{"config", "get", "--json"}, 0},
-		{"json keeps the default with a path", []string{"config", "get", "agents.list", "--json"}, 0},
-		{"agents list json keeps the default", []string{"agents", "list", "--json"}, 0},
-		{"an unknown shape keeps the default", []string{"doctor"}, 0},
+	for _, args := range [][]string{
+		{"doctor"},
+		// `config file` deliberately has no rule any more. Its answer is the last
+		// line of a stdout it shares with Doctor and plugin warnings, so a rule
+		// could only ask "does the last line look like a path" — and review broke
+		// exactly that with a warning line that was one. See
+		// openclawActiveConfigPath, which prefers `config validate --json`.
+		{"config", "file"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := openclawQuietIdleGrace(tc.args); got != tc.want {
-				t.Errorf("openclawQuietIdleGrace(%v) = %v, want %v", tc.args, got, tc.want)
-			}
-		})
-	}
-
-	if openclawConfigFileIdleGrace <= measuredWarningGap {
-		t.Errorf("config file grace %v must exceed the measured warning gap %v, or the "+
-			"early return stays eligible to fire on a Doctor line",
-			openclawConfigFileIdleGrace, measuredWarningGap)
+		if rule := openclawOutputComplete(args); rule != nil {
+			t.Errorf("%v must have no completeness rule, so the runner waits for exit "+
+				"instead of judging output whose shape cannot identify the answer", args)
+		}
 	}
 }
 
-// TestExecOpenclawCLISurvivesTheWarningGapBeforeThePath is the behavioural half:
-// a CLI that prints a warning block, goes quiet for longer than the default
-// grace, then prints the real path must yield the path.
+// TestExecOpenclawCLIToleratesNonExitingCLI covers the second failure mode:
+// a CLI that prints its answer and then never exits.
 //
-// The rule is what makes this safe — a box-drawing border is not an absolute
-// path, so the early return is not eligible during the gap — and the grace is
-// defence in depth for a rule that turns out to accept some warning line. This
-// test would pass on the border alone; it exists to pin the whole shape end to
-// end, at a gap length the default grace does not cover.
-func TestExecOpenclawCLISurvivesTheWarningGapBeforeThePath(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "openclaw")
-	want := filepath.Join(dir, "openclaw.json")
-	// The gap is scaled down from the measured 3285ms so the test stays quick,
-	// but it is still comfortably past DefaultQuietIdleGrace.
-	script := "#!/bin/sh\n" +
-		"printf '\\342\\224\\214\\342\\224\\200\\342\\224\\220\\n'\n" +
-		"printf '| doctor: something to look at |\\n'\n" +
-		"printf '\\342\\224\\224\\342\\224\\200\\342\\224\\230\\n'\n" +
-		"sleep 1\n" +
-		"printf '%s\\n' '" + want + "'\n" +
-		"sleep 300\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatalf("write stub: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	start := time.Now()
-	out, err := execOpenclawCLI(ctx, bin, "config", "file")
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("execOpenclawCLI: %v", err)
-	}
-	if got := openclawLastNonEmptyLine(out); got != want {
-		t.Errorf("answer = %q, want %q — a gap before the path must not strand the "+
-			"early return on the warning block", got, want)
-	}
-	// It must not have waited out the stub's `sleep 300`, i.e. the early return
-	// is what ended the call.
-	if elapsed > 15*time.Second {
-		t.Errorf("took %v — the early return did not fire", elapsed)
-	}
-}
-
-// TestExecOpenclawCLIToleratesNonExitingCLI covers the second failure mode.
-// Measured on the host, `openclaw config file` printed the path in ~250ms and
-// then hung until killed, which reached the user as
+// Measured on a 2026.5.27 host, `openclaw config file` printed the path in ~250ms
+// and then hung until killed, which reached the user as
 //
 //	agent_error.process_failure (prepare execution environment: execenv:
 //	prepare openclaw config: locate openclaw active config:
 //	openclaw config file: context deadline exceeded (process: signal: killed))
 //
 // while the answer had been on stdout the whole time.
+//
+// Exercised on a `--json` subcommand, because that is where the tolerance lives
+// now: a JSON document is recognisable as finished, so waiting is provably
+// unnecessary. `config file` gave up its early return — see
+// TestOpenclawActiveConfigPathFailsClosedWhenConfigFileNeverExits for what it
+// does instead.
 func TestExecOpenclawCLIToleratesNonExitingCLI(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "openclaw")
-	// Statable for the same reason as above, even though this test only inspects
-	// the raw stdout: a hard-coded /root/... path here would be a trap for
-	// whoever next adds a parse to this test.
-	cfgPath := filepath.Join(dir, "openclaw.json")
-	if err := os.WriteFile(cfgPath, []byte("{}\n"), 0o644); err != nil {
-		t.Fatalf("write fake config: %v", err)
-	}
 	body := "#!/bin/sh\n" +
-		"printf '%s\\n' '" + cfgPath + "'\n" +
+		"printf '{\"mcp\":{}}\\n'\n" +
 		"sleep 300\n"
 	if err := os.WriteFile(bin, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake openclaw: %v", err)
@@ -403,18 +233,152 @@ func TestExecOpenclawCLIToleratesNonExitingCLI(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	out, err := execOpenclawCLI(ctx, bin, "config", "file")
+	out, err := execOpenclawCLI(ctx, bin, "config", "get", "mcp", "--json")
 	elapsed := time.Since(start)
 
 	if err != nil {
 		t.Fatalf("execOpenclawCLI: %v", err)
 	}
-	if strings.TrimSpace(out) != cfgPath {
-		t.Errorf("stdout = %q, want the printed path", out)
+	if strings.TrimSpace(out) != `{"mcp":{}}` {
+		t.Errorf("stdout = %q, want the printed document", out)
 	}
 	// Loose on purpose: only has to sit far below the 60s ctx and the stub's 300s
 	// sleep, either of which a broken mechanism would take.
 	if elapsed > 10*time.Second {
 		t.Errorf("took %v — waited for an exit that never comes", elapsed)
+	}
+}
+
+// writeOpenclawConfigStub writes a stub CLI that answers `config validate --json`
+// with validateOut and `config file` with fileOut, and appends trailing to the
+// `config file` branch (for stubs that must linger or delay).
+func writeOpenclawConfigStub(t *testing.T, validateOut, fileOut, fileTrailing string) string {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "openclaw")
+	body := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"config\" ] && [ \"$2\" = \"validate\" ]; then\n" +
+		validateOut +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"config\" ] && [ \"$2\" = \"file\" ]; then\n" +
+		fileOut +
+		fileTrailing +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 9\n"
+	if err := os.WriteFile(bin, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake openclaw: %v", err)
+	}
+	return bin
+}
+
+// TestOpenclawActiveConfigPathIgnoresAPathShapedWarning is the regression for the
+// second review finding on #6275, and the reason `config file` is no longer the
+// primary source of the config path.
+//
+// The reproduction from that review: a CLI whose last warning line is itself an
+// existing path, followed by a pause longer than any fixed grace, followed by the
+// real path. Judging `config file`'s stdout by shape returned the warning path
+// after 5.57s — before the real answer existed — and expandOpenclawPath then
+// turned it into a confident absolute path, so nothing downstream caught it.
+//
+// `config validate --json` reports the path in a named field, so the warning
+// cannot be mistaken for it however long the CLI pauses. This test keeps the
+// hostile `config file` branch in the stub precisely so that a future change that
+// reinstates shape-based parsing as the primary path fails here.
+func TestOpenclawActiveConfigPathIgnoresAPathShapedWarning(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "openclaw.json")
+	warnPath := filepath.Join(dir, "plugin-cache.json")
+	for _, p := range []string{realPath, warnPath} {
+		if err := os.WriteFile(p, []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	bin := writeOpenclawConfigStub(t,
+		"  printf '{\"valid\":true,\"path\":\"%s\"}\\n' '"+realPath+"'\n",
+		"  printf 'plugin cache written to:\\n'\n  printf '%s\\n' '"+warnPath+"'\n",
+		"  sleep 6\n  printf '%s\\n' '"+realPath+"'\n")
+
+	start := time.Now()
+	got, exists, err := openclawActiveConfigPath(bin, 30*time.Second)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("openclawActiveConfigPath: %v", err)
+	}
+	if got != realPath {
+		t.Errorf("path = %q, want %q — a path-shaped warning line was accepted as the answer",
+			got, realPath)
+	}
+	if !exists {
+		t.Error("exists = false for a file that is on disk")
+	}
+	// The validate answer arrives immediately, so this must not have paid the
+	// `config file` branch's 6s pause at all.
+	if elapsed > 5*time.Second {
+		t.Errorf("took %v — the JSON answer was not preferred", elapsed)
+	}
+}
+
+// TestOpenclawActiveConfigPathFallsBackToConfigFile keeps the fallback honest: a
+// CLI whose `config validate --json` is unusable (too old, or a shape we do not
+// recognise) must still resolve through `config file`.
+func TestOpenclawActiveConfigPathFallsBackToConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "openclaw.json")
+	if err := os.WriteFile(realPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		validateOut string
+	}{
+		{"validate prints nothing", "  :\n"},
+		{"validate prints non-JSON", "  echo 'Unknown command: validate' >&2\n"},
+		{"validate omits the path field", "  printf '{\"valid\":true}\\n'\n"},
+		{"validate reports a relative path", "  printf '{\"valid\":false,\"path\":\"openclaw.json\"}\\n'\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := writeOpenclawConfigStub(t, tc.validateOut,
+				"  printf '%s\\n' '"+realPath+"'\n", "")
+			got, exists, err := openclawActiveConfigPath(bin, 30*time.Second)
+			if err != nil {
+				t.Fatalf("openclawActiveConfigPath: %v", err)
+			}
+			if got != realPath || !exists {
+				t.Errorf("path = %q exists = %v, want %q true", got, exists, realPath)
+			}
+		})
+	}
+}
+
+// TestOpenclawActiveConfigPathFailsClosedWhenConfigFileNeverExits is the other
+// side of dropping the `config file` completeness rule: with no way to recognise
+// the answer, a CLI that prints something and then hangs must fail rather than
+// have its output guessed at.
+//
+// This is a deliberate loss of tolerance on that one command, taken because the
+// alternative was demonstrated to return a wrong path. The deadline is what makes
+// it bounded, and MULTICA_OPENCLAW_CLI_TIMEOUT (#7142) is what makes it tunable.
+func TestOpenclawActiveConfigPathFailsClosedWhenConfigFileNeverExits(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "openclaw.json")
+	bin := writeOpenclawConfigStub(t,
+		"  echo 'validate unsupported' >&2\n",
+		"  printf '%s\\n' '"+realPath+"'\n",
+		"  sleep 300\n")
+
+	start := time.Now()
+	_, _, err := openclawActiveConfigPath(bin, 3*time.Second)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a `config file` that never exits must fail closed, not have its " +
+			"stdout accepted on shape")
+	}
+	if elapsed > 20*time.Second {
+		t.Errorf("took %v — the deadline did not bound the call", elapsed)
 	}
 }

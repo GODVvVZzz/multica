@@ -296,37 +296,37 @@ func checkOpenclawVersion(ctx context.Context, runtimeCmd Command) error {
 	ctx, cancel := context.WithTimeout(ctx, detectVersionTimeout)
 	defer cancel()
 
-	// RunCollectCmd for the reason recorded on openclawCLITimeout: it owns the
-	// pipes, so Wait returns on the direct child's exit whatever a descendant is
-	// holding. combinedOutputOwned reaps the tree too, but through os/exec's own
-	// copy goroutines, so `openclaw --version` leaving its config helper on the
-	// pipe costs probeWaitDelay and then reports exec.ErrWaitDelay — failing the
-	// gate, and with it the task, on a version string already in the buffer.
+	// combinedOutputOwned, for the reason recorded on detectCLIVersion: pipe EOF
+	// is the signal that no more output is coming, and the direct child's exit is
+	// not. openclaw is npm-installed, so on Windows the direct child is a shim and
+	// the real CLI is already a descendant.
 	//
 	// Both streams are parsed, and extractVersionLine is deliberately bypassed.
-	// This replaced combinedOutputOwned (cmd.CombinedOutput() before that), and
-	// dropping stderr would fail the gate outright on a build that prints its
-	// version there. Two buffers rather than one shared writer costs the
-	// stdlib's single interleaving, which nothing here reads: the two are
-	// concatenated below and scanned as one text. parseOpenclawVersion
-	// already scans the whole text with openclaw's own version pattern, whereas
-	// picking "the first line containing a semver" first would let unrelated
-	// stderr noise answer for it — a node deprecation warning carries one.
-	// stdout is offered first so it wins when both streams match.
+	// CombinedOutput rather than separate buffers because a build that prints its
+	// banner on stderr must still pass the gate, and one shared writer is what
+	// makes os/exec give the two streams a single pipe and therefore one
+	// interleaving. parseOpenclawVersion already scans the whole text with
+	// openclaw's own version pattern, whereas picking "the first line containing a
+	// semver" first would let unrelated stderr noise answer for it — a node
+	// deprecation warning carries one.
 	cmd := runtimeCmd.exec(ctx, "--version")
-	stdout, stderr, err := RunCollectCmd(ctx, cmd, nil)
+	hideAgentWindow(cmd)
+	raw, err := combinedOutputOwned(cmd, runtimeCmd.logger)
+	out := string(raw)
+	detected, parsed := parseOpenclawVersion(out)
 	if err != nil {
-		// ExplainExecError by hand: detectCLIVersion applies it on the daemon's
-		// probe path, and this is the other gate that has to name an ENOEXEC
-		// shim rather than report an opaque exec failure (MUL-6164).
-		return fmt.Errorf("openclaw --version failed: %w", ExplainExecError(err))
+		// The gate may proceed on a version that arrived before a lingering
+		// `openclaw-config` helper held the pipes past WaitDelay — failing here
+		// would fail the task over an answer we have. Anything else (non-zero
+		// exit, deadline) still fails; see salvageProbeAnswer.
+		if !salvageProbeAnswer(runtimeCmd, "--version", parsed, err) {
+			// ExplainExecError by hand: detectCLIVersion applies it on the daemon's
+			// probe path, and this is the other gate that has to name an ENOEXEC
+			// shim rather than report an opaque exec failure (MUL-6164).
+			return fmt.Errorf("openclaw --version failed: %w", ExplainExecError(err))
+		}
 	}
-	out := string(stdout)
-	if trimmed := strings.TrimSpace(stderr); trimmed != "" {
-		out += "\n" + trimmed
-	}
-	detected, ok := parseOpenclawVersion(out)
-	if !ok {
+	if !parsed {
 		return fmt.Errorf("could not parse openclaw version from output: %q", strings.TrimSpace(out))
 	}
 	if compareOpenclawVersion(detected, minOpenclawVersion) < 0 {

@@ -2579,26 +2579,24 @@ func discoverOpenclawAgents(ctx context.Context, runtimeCmd Command) ([]Model, e
 	// Try JSON modes first. Different openclaw builds expose the
 	// flag under different names; trying a couple is cheap.
 	//
-	// RunCollectQuiet, not outputOwned, for two measured reasons. openclaw
-	// forks an `openclaw-config` helper that inherits stdout; outputOwned lets
-	// os/exec own the copy goroutines, so Wait waits for that pipe to reach EOF
-	// and each attempt parks until probeWaitDelay expires — then returns
-	// exec.ErrWaitDelay with the catalog already in the buffer. Four attempts
-	// pay that four times. And `openclaw agents list` prints the correct list
-	// in ~250ms and then does not exit at all, so waiting for exit spent the
-	// whole 30s budget to arrive at output we already had. See run_collect.go /
-	// MUL-5467.
+	// outputOwned, and this loop already has the salvage built in: a lingering
+	// `openclaw-config` helper makes Wait report exec.ErrWaitDelay with the
+	// catalog in the buffer, and `err != nil && len(out) == 0` lets a populated
+	// buffer through to the parse. The parse is the real gate — a truncated list
+	// does not unmarshal, so a short catalog cannot be mistaken for the real one.
 	//
-	// JSONOutputComplete is what makes the early return safe: a list still being
-	// written does not parse, so a truncated catalog can never be mistaken for
-	// the real one.
+	// Not the collector in run_collect_quiet.go: it returns on the direct child's
+	// exit, and a wrapper that exits before the real CLI has printed would have
+	// its catalog killed mid-write. Pipe EOF is the signal that no more output is
+	// coming. See detectCLIVersion.
 	for _, jsonArgs := range [][]string{
 		{"agents", "list", "--json"},
 		{"agents", "list", "--output", "json"},
 		{"agents", "list", "-o", "json"},
 	} {
 		cmd := runtimeCmd.exec(runCtx, jsonArgs...)
-		out, _, _, err := RunCollectQuietCmd(runCtx, cmd, nil, 0, JSONOutputComplete)
+		hideAgentWindow(cmd)
+		out, err := outputOwned(cmd, runtimeCmd.logger)
 		if err != nil && len(out) == 0 {
 			continue
 		}
@@ -2610,15 +2608,9 @@ func discoverOpenclawAgents(ctx context.Context, runtimeCmd Command) ([]Model, e
 	// Text fallback. Be strict — the default output is a decorated
 	// banner with box-drawing and section headers, and picking up
 	// the wrong tokens produces nonsense entries like "Identity:".
-	//
-	// RunCollect (wait for exit) rather than the quiet variant: decorated text
-	// has no completeness rule, so an early return could yield a partial agent
-	// list, and a silently short catalog is worse than a slow one. Against
-	// outputOwned it still buys the two things that matter here — Wait returns
-	// on the CLI's own exit instead of on the forked helper's, and the exit
-	// status reported is the CLI's rather than exec.ErrWaitDelay.
 	cmd := runtimeCmd.exec(runCtx, "agents", "list")
-	out, _, err := RunCollectCmd(runCtx, cmd, nil)
+	hideAgentWindow(cmd)
+	out, err := outputOwned(cmd, runtimeCmd.logger)
 	if err != nil && len(out) == 0 {
 		return []Model{}, nil
 	}
