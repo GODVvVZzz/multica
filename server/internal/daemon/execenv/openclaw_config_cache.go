@@ -15,8 +15,8 @@ import (
 )
 
 // OpenClaw config discovery costs two serial CLI round-trips per task
-// preparation in the common case (`config file`, then
-// `config get agents.list --json`; see openclawMaxCLICallsPerPreparation for
+// preparation in the common case (`config validate --json`, then
+// `config get agents.list --json`; see openclawMaxCLIDeadlinesPerPreparation for
 // the worst case). On a fast host that is ~1s total; on the Intel Mac in #7112
 // it is ~12.7s, and it is paid again for every task — including every chat
 // message, because Reuse runs the same preparation path as Prepare. Raising
@@ -28,11 +28,11 @@ import (
 // (PrepareIsolated / ReuseIsolated), so an in-process cache would never
 // survive to the next task.
 //
-// What is NOT cached: the resolved `mcp` subtree read by
-// openclawResolvedMcpConfig. It is small, but it is per-agent state that has to
-// reflect the user's config as it is now rather than as it was for some earlier
-// task, and that call already only happens for agents with a managed
-// mcp_config.
+// What is NOT cached, and no longer exists to cache: the resolved config read
+// this flow used to make for a managed mcp_config. Managed MCP is now prepared
+// from a reset stage this package writes, so there is no per-agent CLI payload on
+// this path at all — one fewer thing whose staleness would have to be reasoned
+// about, and one fewer copy of the user's configuration anywhere.
 const (
 	// openclawDiscoveryCacheFile is the per-profile cache file name. It sits
 	// in the profile directory (~/.multica[/profiles/<name>]) so every task on
