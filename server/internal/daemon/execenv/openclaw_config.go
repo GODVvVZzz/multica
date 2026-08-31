@@ -114,7 +114,7 @@ const (
 	// openclawCLIMaxTimeout keeps config discovery inside the outer task
 	// preparation budget (daemon.defaultTaskPrepareTimeout, 5 minutes). The
 	// worst case is openclawMaxCLIDeadlinesPerPreparation serial steps, so the
-	// ceiling is set so that even then (4 x 60s = 4m) the failure surfaces as a
+	// ceiling is set so that even then (3 x 60s = 3m) the failure surfaces as a
 	// specific, actionable CLI timeout with room to spare, instead of colliding
 	// with the outer deadline and collapsing into the generic — and retryable —
 	// prepare-timeout reason. A step may make more than one invocation — path
