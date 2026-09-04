@@ -300,6 +300,161 @@ func TestResolveTextFlag(t *testing.T) {
 	})
 }
 
+// withWorkdirShape chdirs into a workdir that is either reached through a
+// symlink (logical) or is its own canonical path, and returns the temp dir the
+// case may use as "outside". BOTH shapes matter, and for opposite reasons:
+//
+//   - logical: os.Getwd() prefers $PWD when it names the current directory, and
+//     everything that sets $PWD carries the path as typed — a shell's `cd`,
+//     testing.T.Chdir, and the PWD the daemon exports to agent processes (see
+//     pkg/agent/opencode.go). This is the shape where an unresolved candidate
+//     reads as "outside the workdir" though it plainly is not.
+//   - canonical: this is the shape where an unresolved candidate reads as
+//     "inside the workdir" although a symlink takes it out — so it is the only
+//     shape in which the escape-hatch cases below can fail. Run them only under
+//     the logical shape and they pass no matter what the code does, because
+//     there everything unresolved looks outside.
+func withWorkdirShape(t *testing.T, canonical bool) (outside string) {
+	t.Helper()
+	root := t.TempDir()
+	physical := filepath.Join(root, "physical")
+	if err := os.MkdirAll(physical, 0o755); err != nil {
+		t.Fatalf("mkdir workdir: %v", err)
+	}
+	workdir := filepath.Join(root, "logical")
+	if err := os.Symlink(physical, workdir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if canonical {
+		resolved, err := filepath.EvalSymlinks(physical)
+		if err != nil {
+			t.Fatalf("resolve workdir: %v", err)
+		}
+		workdir = resolved
+	}
+	t.Chdir(workdir)
+	return t.TempDir()
+}
+
+// TestFileWithinWorkingDir covers the containment predicate behind the
+// MUL-4252 guardrail directly, because the callers only ever exercise it with
+// files that already exist — and existence is precisely what used to hide the
+// bug. A candidate that does not exist yet cannot go through
+// filepath.EvalSymlinks, and the fallbacks it used to have (one filepath.Dir
+// step, then filepath.Clean) left it unresolved as soon as an intermediate
+// directory was missing too. That failed in both directions:
+//
+//   - Against a workdir reached through a symlink, `subdir/report.md` read as
+//     outside the workdir. The command then reported a missing file as a
+//     guardrail violation and advised --allow-external-file — the one move that
+//     makes things worse, since it only disables the guard.
+//   - Against a canonical workdir, `escape/sub/report.md` — where `escape` is a
+//     symlink out of the workdir — read as INSIDE it, so the guard admitted a
+//     path that resolves to a machine-shared directory.
+func TestFileWithinWorkingDir(t *testing.T) {
+	for _, shape := range []struct {
+		name      string
+		canonical bool
+	}{
+		{name: "workdir reached through a symlink", canonical: false},
+		{name: "canonical workdir", canonical: true},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			outside := withWorkdirShape(t, shape.canonical)
+			sep := string(filepath.Separator)
+			if err := os.WriteFile("exists.txt", []byte("x"), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			// `nested` exists so the ".."-comes-back-inside row exercises real
+			// resolution. It deliberately is NOT the directory the
+			// missing-intermediate rows name: give those an existing parent and
+			// a one-level fallback handles them, so the rows stop failing
+			// against unresolved comparisons and stop covering the regression
+			// they exist for.
+			if err := os.Mkdir("nested", 0o755); err != nil {
+				t.Fatalf("mkdir fixture: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(outside, "stale.md"), []byte("x"), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			// sibling.md sits NEXT TO the symlink's target, i.e. one ".." away
+			// from it, and it exists — so a guard that collapses ".." lexically
+			// does not merely misjudge, it admits a readable outside file.
+			escapeTarget := filepath.Join(outside, "shared")
+			if err := os.Mkdir(escapeTarget, 0o755); err != nil {
+				t.Fatalf("mkdir fixture: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(outside, "sibling.md"), []byte("another run's file"), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(escapeTarget, "stale.md"), []byte("x"), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			// A symlink inside the workdir pointing out of it: the escape hatch
+			// the resolution exists to close. It has to stay closed however much
+			// of the path below it is missing.
+			if err := os.Symlink(escapeTarget, "escape"); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+
+			cases := []struct {
+				name string
+				path string
+				want bool
+			}{
+				{name: "existing file in the workdir", path: "exists.txt", want: true},
+				{name: "missing leaf in the workdir", path: "missing.txt", want: true},
+				{name: "missing intermediate directory", path: "subdir/report.md", want: true},
+				{name: "several missing levels", path: "a/b/c/d/report.md", want: true},
+				{name: "the workdir itself", path: ".", want: true},
+				{name: "existing file outside the workdir", path: filepath.Join(outside, "stale.md"), want: false},
+				{name: "missing file outside the workdir", path: filepath.Join(outside, "gone", "stale.md"), want: false},
+				{name: "relative traversal out of the workdir", path: filepath.Join("..", "escaped.md"), want: false},
+				{name: "traversal that comes back inside", path: "nested" + sep + ".." + sep + "exists.txt", want: true},
+				{name: "symlinked escape hatch", path: filepath.Join("escape", "stale.md"), want: false},
+				{name: "symlinked escape hatch with a missing leaf", path: filepath.Join("escape", "missing.md"), want: false},
+				{name: "symlinked escape hatch with a missing directory", path: filepath.Join("escape", "sub", "missing.md"), want: false},
+				{name: "symlinked escape hatch with several missing levels", path: filepath.Join("escape", "a", "b", "missing.md"), want: false},
+				// ".." AFTER a symlink is the case a lexical clean gets wrong:
+				// the string collapses to a path inside the workdir, while the
+				// kernel follows `escape` out of it first and then goes up. The
+				// file it lands on exists, so os.ReadFile really would read
+				// another run's file — no race needed.
+				{name: "dot-dot across the symlinked escape hatch", path: "escape" + sep + ".." + sep + "sibling.md", want: false},
+			}
+
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					got, err := fileWithinWorkingDir(tc.path)
+					if err != nil {
+						t.Fatalf("fileWithinWorkingDir(%q): %v", tc.path, err)
+					}
+					if got != tc.want {
+						t.Errorf("fileWithinWorkingDir(%q) = %v, want %v", tc.path, got, tc.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestEnsureFileFlagWithinWorkdirReportsMissingFileAsMissing is the
+// caller-level shape of the same bug: the guardrail must not intercept a path
+// that is inside the workdir, or the error the agent reads points at
+// --allow-external-file instead of at the file it forgot to write.
+func TestEnsureFileFlagWithinWorkdirReportsMissingFileAsMissing(t *testing.T) {
+	withWorkdirShape(t, false)
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().Bool("allow-external-file", false, "")
+
+	if err := ensureFileFlagWithinWorkdir(cmd, "content-file", "content", "subdir/report.md"); err != nil {
+		t.Fatalf("in-workdir path must pass the guardrail, got %v", err)
+	}
+	if err := ensureAttachmentWithinWorkdir(cmd, "out/chart.png"); err != nil {
+		t.Fatalf("in-workdir attachment must pass the guardrail, got %v", err)
+	}
+}
+
 // TestEnsureAttachmentWithinWorkdir covers the MUL-4252 guardrail extended to
 // --attachment: a local attachment path outside the task workdir is rejected
 // (so an agent can't attach another run's stale /tmp file), with the same
