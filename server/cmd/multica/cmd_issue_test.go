@@ -455,6 +455,48 @@ func TestEnsureFileFlagWithinWorkdirReportsMissingFileAsMissing(t *testing.T) {
 	}
 }
 
+// TestExternalFileErrorLeadsWithMissingFile pins the remaining half of the
+// misleading diagnosis. For a path that is genuinely outside the workdir AND
+// does not exist, the guard used to advise --allow-external-file and nothing
+// else, so the agent's reasonable next move was to disable the guard and retry
+// — earning a second, unrelated "no such file" error. There is no stale file to
+// protect anyone from when the path does not exist, so the missing file is the
+// fact that leads.
+func TestExternalFileErrorLeadsWithMissingFile(t *testing.T) {
+	outside := withWorkdirShape(t, false)
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().Bool("allow-external-file", false, "")
+
+	missing := filepath.Join(outside, "desc.md")
+	err := ensureFileFlagWithinWorkdir(cmd, "description-file", "description", missing)
+	if err == nil {
+		t.Fatal("expected an error for a missing path outside the workdir")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("error should lead with the missing file, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "outside the current working directory") {
+		t.Errorf("error should still record that the path is external, got: %v", err)
+	}
+
+	// An existing external file is the case the guard was built for: the
+	// wording must keep pointing at the escape hatch.
+	stale := filepath.Join(outside, "stale.md")
+	if err := os.WriteFile(stale, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	err = ensureAttachmentWithinWorkdir(cmd, stale)
+	if err == nil {
+		t.Fatal("expected an error for an existing path outside the workdir")
+	}
+	if strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("an existing file must not be reported as missing, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "allow-external-file") {
+		t.Errorf("error should point at --allow-external-file, got: %v", err)
+	}
+}
+
 // TestEnsureAttachmentWithinWorkdir covers the MUL-4252 guardrail extended to
 // --attachment: a local attachment path outside the task workdir is rejected
 // (so an agent can't attach another run's stale /tmp file), with the same

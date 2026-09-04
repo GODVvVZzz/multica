@@ -110,6 +110,13 @@ func ensureFileFlagWithinWorkdir(cmd *cobra.Command, fileFlag, flagName, filePat
 		return fmt.Errorf("resolve --%s path %q: %w", fileFlag, filePath, err)
 	}
 	if !within {
+		if !pathExists(filePath) {
+			return fmt.Errorf(
+				"--%s path %q does not exist; it also resolves outside the current working directory, "+
+					"so --allow-external-file would not make this read succeed. Write the file inside the "+
+					"task workdir (e.g. ./%s.md) and pass that path.",
+				fileFlag, filePath, flagName)
+		}
 		return fmt.Errorf(
 			"--%s path %q resolves outside the current working directory; "+
 				"write agent temp files inside the run workdir (e.g. ./%s.md) rather than machine-shared "+
@@ -118,6 +125,18 @@ func ensureFileFlagWithinWorkdir(cmd *cobra.Command, fileFlag, flagName, filePat
 			fileFlag, filePath, flagName)
 	}
 	return nil
+}
+
+// pathExists reports whether filePath names something on disk. It exists to
+// separate the two facts the containment guard used to merge: a rejected path
+// that is ALSO missing has no stale file behind it for anyone to read by
+// mistake, so leading with --allow-external-file sends the caller to disable
+// the guard and hit an unrelated not-found error on the retry. Any stat error
+// other than "not exists" (a permission wall, a broken mount) is treated as
+// "exists" so the guard keeps its own wording and stays fail-closed.
+func pathExists(filePath string) bool {
+	_, err := os.Stat(filePath)
+	return !errors.Is(err, os.ErrNotExist)
 }
 
 // fileWithinWorkingDir reports whether filePath resolves to a location inside
@@ -1086,6 +1105,13 @@ func ensureAttachmentWithinWorkdir(cmd *cobra.Command, filePath string) error {
 		return fmt.Errorf("resolve --attachment path %q: %w", filePath, err)
 	}
 	if !within {
+		if !pathExists(filePath) {
+			return fmt.Errorf(
+				"--attachment path %q does not exist; it also resolves outside the current working "+
+					"directory, so --allow-external-file would not make this upload succeed. Generate the "+
+					"file inside the task workdir and attach that path.",
+				filePath)
+		}
 		return fmt.Errorf(
 			"--attachment path %q resolves outside the current working directory; "+
 				"attach files generated inside the run workdir rather than machine-shared "+
