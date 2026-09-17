@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/util"
@@ -19,9 +20,9 @@ import (
 //
 // It deliberately does NOT assert on the mode bits. Whether os.Lstat reports a
 // junction with ModeSymlink depends on the GODEBUG winsymlink setting (see the
-// test below), so a fixture that fatals on that observation would destroy the
-// coverage of the test it sets up. The bits are logged instead, so a CI run
-// records what the platform did.
+// junction test below), so a fixture that fatals on that observation would
+// destroy the coverage of the test it sets up. The bits are logged instead, so
+// a CI run records what the platform did.
 func createJunction(t *testing.T, src, dst string) {
 	t.Helper()
 	if out, err := exec.Command("cmd", "/c", "mklink", "/J", dst, src).CombinedOutput(); err != nil {
@@ -45,13 +46,14 @@ func createJunction(t *testing.T, src, dst string) {
 // TestFileWithinWorkingDirWindowsPaths runs the containment guard's core
 // judgments on Windows, where the path grammar the resolution walks is not the
 // one the Linux and macOS jobs exercise: paths carry a volume, both `\` and `/`
-// separate, and a root behaves differently from `/` (see the drive-letter case
-// at the end). cmd/multica is not part of any Windows job today, so without
-// this file none of that is covered anywhere. It matters twice over on a
-// non-admin host, where the cross-platform cases skip for want of the symlink
+// separate, and several relative kinds do not resolve against the working
+// directory at all. cmd/multica is not part of any Windows job otherwise, so
+// without this file none of that is covered anywhere. It matters twice over on
+// a non-admin host, where the cross-platform cases skip for want of the symlink
 // privilege while a junction needs none.
 func TestFileWithinWorkingDirWindowsPaths(t *testing.T) {
-	t.Chdir(t.TempDir())
+	workdir := t.TempDir()
+	t.Chdir(workdir)
 	if err := os.WriteFile("exists.txt", []byte("x"), 0o644); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
@@ -83,6 +85,73 @@ func TestFileWithinWorkingDirWindowsPaths(t *testing.T) {
 		})
 	}
 
+	t.Run("a root-relative path is judged against its volume root, not the workdir", func(t *testing.T) {
+		// `\tmp\desc.md` is not relative to the working directory: the loader
+		// resolves it against the root of the current directory's volume, so
+		// os.ReadFile opens `C:\tmp\desc.md` no matter where the workdir sits.
+		// A guard that prefixes the workdir instead inspects
+		// `C:\task\workdir\tmp\desc.md` — and with that shadow present, an
+		// outside read passes on the shadow. The drive-relative sibling case
+		// (`C:tmp\desc.md`) is the same trap one level up. Both must read as
+		// outside here, and the drive-relative same-drive case below pins the
+		// one shape that legitimately DOES resolve into the workdir.
+		if err := os.MkdirAll(filepath.Join(workdir, "tmp"), 0o755); err != nil {
+			t.Fatalf("mkdir shadow dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(workdir, "tmp", "desc.md"), []byte("shadow"), 0o644); err != nil {
+			t.Fatalf("write shadow: %v", err)
+		}
+		for _, candidate := range []string{`\tmp\desc.md`, "/tmp/desc.md"} {
+			within, err := fileWithinWorkingDir(candidate)
+			if err != nil {
+				t.Fatalf("fileWithinWorkingDir(%q): %v", candidate, err)
+			}
+			if within {
+				t.Errorf("fileWithinWorkingDir(%q) = true; the loader would read the volume root's %q, not the in-workdir shadow", candidate, candidate)
+			}
+		}
+	})
+
+	t.Run("a drive-relative path on the current drive resolves against the workdir", func(t *testing.T) {
+		// `C:tmp\desc.md` resolves against the current directory on C:, which
+		// for the current drive IS the process working directory — so this
+		// genuinely reads workdir\tmp\desc.md, and the guard admits it.
+		if err := os.MkdirAll(filepath.Join(workdir, "tmp"), 0o755); err != nil {
+			t.Fatalf("mkdir fixture dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(workdir, "tmp", "desc.md"), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+		vol := filepath.VolumeName(workdir)
+		if vol == "" {
+			t.Fatalf("workdir %q carries no volume name", workdir)
+		}
+		candidate := vol + `tmp\desc.md`
+		within, err := fileWithinWorkingDir(candidate)
+		if err != nil {
+			t.Fatalf("fileWithinWorkingDir(%q): %v", candidate, err)
+		}
+		if !within {
+			t.Errorf("fileWithinWorkingDir(%q) = false; on the current drive this resolves against the workdir itself", candidate)
+		}
+	})
+
+	t.Run("a drive-relative path on another drive reads as outside the workdir", func(t *testing.T) {
+		// The per-drive current directory of a drive the process is not on
+		// cannot be observed, so the resolution hands the path back
+		// uncanonicalized and the guard must fail closed: filepath.Rel
+		// refuses to relate it to the workdir's volume.
+		letter := unusedDriveLetter(t)
+		candidate := letter + `:report.md`
+		within, err := fileWithinWorkingDir(candidate)
+		if err != nil {
+			t.Fatalf("fileWithinWorkingDir(%q) must report the cross-drive path as outside, not as an error: %v", candidate, err)
+		}
+		if within {
+			t.Errorf("fileWithinWorkingDir(%q) = true, want false", candidate)
+		}
+	})
+
 	t.Run("a path on another volume reads as outside the workdir", func(t *testing.T) {
 		// The Windows-only branch of the guard: filepath.Rel cannot relate two
 		// paths on different volumes, and returns an error rather than a "..".
@@ -91,11 +160,11 @@ func TestFileWithinWorkingDirWindowsPaths(t *testing.T) {
 		// it just broke. No Unix input reaches this branch, so this is the only
 		// coverage it has.
 		//
-		// Also measured here (10.0.19045 / go1.26.6): filepath.EvalSymlinks(`Z:\`)
-		// returns `Z:\` with a nil error for a drive letter with no volume behind
-		// it, while os.Stat on the same root fails. That is why the resolution
-		// comes back purely lexical, and why the walk's termination guard stays
-		// unreached even on this shape (see internal/util/path.go).
+		// The resolution comes back purely lexical here, because the walk
+		// starts from the root without needing it to resolve: a drive letter
+		// with no volume behind it never has to answer for itself (measured on
+		// 10.0.19045 / go1.26.6: os.Stat fails at such a root while
+		// filepath.EvalSymlinks reports success).
 		letter := unusedDriveLetter(t)
 		in := letter + `:\multica-does-not-exist-0d1f\a\b`
 		if got := util.ResolveSymlinksBestEffort(in); got != filepath.Clean(in) {
@@ -113,7 +182,8 @@ func TestFileWithinWorkingDirWindowsPaths(t *testing.T) {
 
 // unusedDriveLetter returns a drive letter with no volume behind it. os.Stat is
 // the test, not filepath.EvalSymlinks: on go1.26.2 the latter reports success
-// for such a root, which is exactly the observation this file records.
+// for such a root, which is exactly the observation the cross-volume case
+// records.
 func unusedDriveLetter(t *testing.T) string {
 	t.Helper()
 	for _, letter := range "ZYXWVU" {
@@ -126,59 +196,27 @@ func unusedDriveLetter(t *testing.T) string {
 	return ""
 }
 
-// TestFileWithinWorkingDirWindowsJunctionIsAKnownGap pins what the guard does
-// with a directory junction, the one containment-relevant link shape Windows has
-// that filepath.EvalSymlinks will not descend through (this repo asserts that
-// refusal directly in internal/daemon/config_windows_test.go). Measured on
-// 10.0.19045 / go1.26.6, inside `go test` and again from a standalone program
-// run in this module's context:
+// TestFileWithinWorkingDirWindowsJunctions pins how the guard treats directory
+// junctions — the one containment-relevant link shape Windows has that needs no
+// elevation to create, which is why it is the shape that actually shows up on
+// real hosts (pnpm's node_modules layout is built from them).
 //
-//	os.Lstat(junction)                 mode=?rw-rw-rw- symlinkBit=false irregular=true
-//	fsutil reparsepoint query          0xa0000003, Name Surrogate, Mount Point
-//	EvalSymlinks("escape")             returns "escape", nil        <- resolves to itself
-//	EvalSymlinks(`escape\stale.md`)    "", The system cannot find the path specified.
+// The resolution behind the guard follows junctions itself, because under the
+// winsymlink semantics this module's go directive selects (Go 1.23+) it is
+// filepath.EvalSymlinks that refuses to descend through them: it resolves the
+// junction to its own name, which used to let `workdir\escape\stale.md` —
+// escape a junction pointing out of the workdir — read as inside. Which
+// semantics apply is not a property of the host but of the GODEBUG setting
+// (internal/godebugs/table.go: `winsymlink, Changed: 23, Old: "0"`), so
+// os.Readlink, which answers on a junction under both, is what the resolution
+// uses (see internal/util/path_windows.go). The same refusal is asserted
+// daemon-side in internal/daemon/config_windows_test.go, which is about
+// filepath.EvalSymlinks and unaffected by this.
 //
-// The third line is why the gap exists: the junction itself looks like a
-// perfectly resolved directory, so the ancestor walk stops there and re-attaches
-// the tail lexically. A junction inside the workdir pointing out of it therefore
-// reads as inside — before this change and after it.
-//
-// Which of those two behaviours you get is not a property of the host. It is the
-// GODEBUG `winsymlink` setting, whose default follows the MAIN MODULE's go
-// directive (os/types_windows.go: mode() files a mount point under
-// ModeIrregular, modePreGo1_23() files it under ModeSymlink;
-// internal/godebugs/table.go: `winsymlink, Changed: 23, Old: "0"`). This module
-// declares go 1.26.6, so the modern semantics above are what the CLI ships with,
-// and the same is true of the daemon-side test that asserts the refusal.
-//
-// Outside a module there is no go directive to follow, so the default comes from
-// the toolchain that compiled the probe instead — which under GOTOOLCHAIN=auto is
-// the base go on PATH, not the one this module selects. A probe built that way
-// with a pre-1.23 base toolchain resolves junctions happily and contradicts
-// everything above: take junction observations from inside this module, or state
-// the toolchain.
-//
-// The gap is deliberate, not overlooked. Failing closed on a component that
-// exists but cannot be canonicalized would reject every path under a pnpm-style
-// node_modules junction, and worse: on a host whose workdir is itself reached
-// through a junction it would reject every --content-file and --attachment on
-// that host, which is a larger break than the one it prevents.
-//
-// Closing it does not need GetFinalPathNameByHandle: os.Readlink answers on a
-// junction under both winsymlink settings, returning a clean absolute target with
-// no \??\ prefix, and it answers even when the target no longer exists. Measured
-// in this module's context on the same host, alongside the two facts that decide
-// whether resolving is safe: a junction pointing INSIDE the workdir (the pnpm
-// shape) resolves to a path still inside it, so resolving costs no false
-// rejections; and a junction chain needs a bounded follow loop, since one
-// Readlink step only reaches the next link. That is a behaviour change on Windows
-// with its own blast radius, so it belongs in its own change rather than riding
-// along here.
-//
-// The assertion is written so it fails, loudly and with instructions, if the
-// platform ever starts resolving junctions: the guard's answer must track what
-// the resolution can actually see.
-func TestFileWithinWorkingDirWindowsJunctionIsAKnownGap(t *testing.T) {
+// A junction pointing INSIDE the workdir — the pnpm shape — must keep reading
+// as inside: resolving costs no false rejections there, measured alongside the
+// escape facts on the same host.
+func TestFileWithinWorkingDirWindowsJunctions(t *testing.T) {
 	workdir := t.TempDir()
 	t.Chdir(workdir)
 	outside := t.TempDir()
@@ -187,25 +225,84 @@ func TestFileWithinWorkingDirWindowsJunctionIsAKnownGap(t *testing.T) {
 	}
 	createJunction(t, outside, filepath.Join(workdir, "escape"))
 
-	candidate := `escape\stale.md`
-	resolved, evalErr := filepath.EvalSymlinks(candidate)
-	within, err := fileWithinWorkingDir(candidate)
-	if err != nil {
-		t.Fatalf("fileWithinWorkingDir(%q): %v", candidate, err)
-	}
-	t.Logf("EvalSymlinks(%q) = %q err=%v", candidate, resolved, evalErr)
-
-	if evalErr == nil {
-		// The platform resolves junctions here, so the guard has to reject.
-		if within {
-			t.Errorf("EvalSymlinks resolves junctions on this host, so %q must read as outside the workdir", candidate)
+	t.Run("a junction out of the workdir is rejected", func(t *testing.T) {
+		candidate := `escape\stale.md`
+		within, err := fileWithinWorkingDir(candidate)
+		if err != nil {
+			t.Fatalf("fileWithinWorkingDir(%q): %v", candidate, err)
 		}
-		return
-	}
-	if !within {
-		t.Fatalf("%q was rejected, which means junction resolution started working "+
-			"somewhere in this path: flip this test to assert rejection and delete "+
-			"the known-gap note above it", candidate)
-	}
-	t.Logf("known gap pinned: EvalSymlinks refuses the junction (%v), so the guard judges %q lexically and admits it", evalErr, candidate)
+		if within {
+			t.Errorf("fileWithinWorkingDir(%q) = true; the junction resolves to %q, outside the workdir", candidate, outside)
+		}
+	})
+
+	t.Run("a junction into the workdir is still admitted", func(t *testing.T) {
+		// The false-rejection direction: a junction whose target stays inside
+		// the workdir resolves to a path that is still inside it, and the
+		// guard must not start rejecting the pnpm shape.
+		if err := os.MkdirAll(filepath.Join(workdir, "inner"), 0o755); err != nil {
+			t.Fatalf("mkdir inner: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(workdir, "inner", "file.md"), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+		createJunction(t, filepath.Join(workdir, "inner"), filepath.Join(workdir, "link"))
+		candidate := `link\file.md`
+		within, err := fileWithinWorkingDir(candidate)
+		if err != nil {
+			t.Fatalf("fileWithinWorkingDir(%q): %v", candidate, err)
+		}
+		if !within {
+			t.Errorf("fileWithinWorkingDir(%q) = false; the junction's target is inside the workdir", candidate)
+		}
+	})
+
+	t.Run("a junction chain out of the workdir is rejected", func(t *testing.T) {
+		// One Readlink step only reaches the next link, so the resolution
+		// splices targets back into the walk; a chain must not fall off the
+		// end of that into a lexical judgment.
+		mid := filepath.Join(workdir, "mid")
+		if err := os.Mkdir(mid, 0o755); err != nil {
+			t.Fatalf("mkdir mid: %v", err)
+		}
+		createJunction(t, outside, filepath.Join(mid, "hop"))
+		createJunction(t, mid, filepath.Join(workdir, "chain"))
+		candidate := `chain\hop\stale.md`
+		within, err := fileWithinWorkingDir(candidate)
+		if err != nil {
+			t.Fatalf("fileWithinWorkingDir(%q): %v", candidate, err)
+		}
+		if within {
+			t.Errorf("fileWithinWorkingDir(%q) = true; the junction chain resolves to %q, outside the workdir", candidate, outside)
+		}
+	})
+
+	t.Run("a junction whose target is gone resolves lexically and stays inert", func(t *testing.T) {
+		// os.Readlink still answers when the target no longer exists, but the
+		// walk cannot resolve THROUGH the dead target, so the junction becomes
+		// the first unresolvable component and the tail is re-attached
+		// lexically — reading as inside. That is the documented inert shape,
+		// not a hole: the kernel stops at the junction too, so nothing after
+		// it can be opened and os.ReadFile surfaces the not-found error. The
+		// containment risk only exists while the target resolves, which the
+		// first case rejects. If this ever starts reading as outside — the
+		// resolution learned to carry the target's missing tail through a
+		// dead junction — the guard's answer gets stricter, which is safe.
+		dangling := t.TempDir()
+		createJunction(t, dangling, filepath.Join(workdir, "dangle"))
+		if err := os.Remove(dangling); err != nil {
+			t.Fatalf("remove junction target: %v", err)
+		}
+		candidate := `dangle\stale.md`
+		within, err := fileWithinWorkingDir(candidate)
+		if err != nil {
+			t.Fatalf("fileWithinWorkingDir(%q): %v", candidate, err)
+		}
+		if !within {
+			t.Errorf("fileWithinWorkingDir(%q) = false; a dead junction resolves nothing and the kernel cannot open the path either way", candidate)
+		}
+		if _, err := os.ReadFile(candidate); !strings.Contains(err.Error(), "cannot find") {
+			t.Logf("os.ReadFile(%q) = %v (the guard's admission is inert only while that is a not-found)", candidate, err)
+		}
+	})
 }

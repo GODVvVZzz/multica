@@ -131,13 +131,44 @@ func TestResolveSymlinksBestEffort(t *testing.T) {
 		}
 	})
 
+	t.Run("dot-dot in the walk applies to the followed path even when the tail is missing", func(t *testing.T) {
+		// The phase-one resolution only sees a ".." when the whole path exists.
+		// Once something is missing the walk takes over, and it must apply the
+		// ".." to the RESOLVED prefix there too: cleaning first would collapse
+		// "esc/.." against the string and report the tail under the workdir,
+		// while the kernel — if the missing components were ever created —
+		// would place them next to the link's target.
+		outsideRoot := t.TempDir()
+		target := filepath.Join(outsideRoot, "out")
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		link := filepath.Join(physical, "esc")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		realOutsideRoot, err := filepath.EvalSymlinks(outsideRoot)
+		if err != nil {
+			t.Fatalf("resolve outside root: %v", err)
+		}
+		// Concatenated, not filepath.Join: Join would clean "esc/.." out of
+		// the input and the walk would never see the link at all — the very
+		// mistake this file exists to catch.
+		sep := string(filepath.Separator)
+		in := filepath.Join(logical, "esc") + sep + ".." + sep + filepath.Join("missingdir", "x.md")
+		want := filepath.Join(realOutsideRoot, "missingdir", "x.md")
+		if got := ResolveSymlinksBestEffort(in); got != want {
+			t.Errorf("ResolveSymlinksBestEffort(%q) = %q, want %q", in, got, want)
+		}
+	})
+
 	t.Run("a fully missing path keeps its lexical tail under the resolved root", func(t *testing.T) {
-		// "/" always resolves, so the walk finds an existing ancestor at the
-		// root and re-attaches everything below it lexically. Note what this
-		// case does NOT cover: the loop's parent == cur guard, which stays
-		// unreached because the root resolves. See the comment on that branch —
-		// it is a termination invariant, and no cheap test on either platform
-		// can reach it.
+		// "/" always resolves, so the walk starts from it and re-attaches
+		// everything below it lexically. The root itself is never resolved by
+		// the walk — it is the starting point — which is what serves the
+		// Windows shape in cmd/multica's cross-volume test: a drive letter
+		// with no volume behind it yields the cleaned lexical form rather
+		// than depending on what EvalSymlinks does at a root.
 		in := filepath.Join(string(filepath.Separator), "multica-does-not-exist-0d1f", "a", "b")
 		want, err := filepath.Abs(in)
 		if err != nil {

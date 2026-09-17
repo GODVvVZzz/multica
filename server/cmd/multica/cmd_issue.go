@@ -141,10 +141,18 @@ func pathExists(filePath string) bool {
 
 // fileWithinWorkingDir reports whether filePath resolves to a location inside
 // the process working directory. Both sides are canonicalized the same way, so
-// aliased roots (e.g. macOS /tmp -> /private/tmp) and symlinks planted inside
-// the workdir fail closed. A path that does not exist yet is resolved as far as
-// it exists, so the caller's os.ReadFile still surfaces the real not-found
-// error afterwards.
+// aliased roots (e.g. macOS /tmp -> /private/tmp), symlinks planted inside the
+// workdir, and directory junctions pointing out of it all fail closed. A path
+// that does not exist yet is resolved as far as it exists, so the caller's
+// os.ReadFile still surfaces the real not-found error afterwards.
+//
+// Windows relative paths are handed over for what they are, not for what they
+// look like: `\tmp\desc.md` resolves against the workdir's volume ROOT and
+// `C:tmp\desc.md` against the current directory on C:, so prefixing the
+// workdir onto either would judge a shadow file while os.ReadFile opens the
+// real one. util.ResolveSymlinksBestEffort preserves those kinds, and a
+// drive-relative path on an unobservable drive comes back uncanonicalized —
+// which is what makes the Rel branch below the fail-closed answer for it.
 func fileWithinWorkingDir(filePath string) (bool, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -178,13 +186,16 @@ func fileWithinWorkingDir(filePath string) (bool, error) {
 	if err != nil {
 		// Two absolute paths that filepath.Rel cannot relate are on different
 		// volumes, which is as far outside the workdir as a path can get. Only
-		// Windows produces this: with a workdir on C:, `--content-file
-		// Z:\report.md` used to surface `Rel: can't make Z:\report.md relative
-		// to C:\...` as an internal resolve failure instead of the guardrail's
-		// own explanation — the same misleading-diagnosis shape this guard is
-		// being fixed for. Measured on 10.0.19045 / go1.26.6. There is no Unix
-		// input that reaches this branch, so the windows-tagged test in this
-		// package is the only thing that covers it.
+		// Windows produces this, in two shapes: an absolute path on another
+		// volume (`--content-file Z:\report.md` used to surface `Rel: can't
+		// make Z:\report.md relative to C:\...` as an internal resolve failure
+		// instead of the guardrail's own explanation), and a drive-relative
+		// path on a drive whose current directory this process cannot observe,
+		// which util.ResolveSymlinksBestEffort hands back uncanonicalized.
+		// Both read as outside here — fail closed. Measured on 10.0.19045 /
+		// go1.26.6. There is no Unix input that reaches this branch, so the
+		// windows-tagged test in this package is the only thing that covers
+		// it.
 		return false, nil
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
