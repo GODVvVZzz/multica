@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -167,7 +168,11 @@ func TestFileWithinWorkingDirWindowsPaths(t *testing.T) {
 		// filepath.EvalSymlinks reports success).
 		letter := unusedDriveLetter(t)
 		in := letter + `:\multica-does-not-exist-0d1f\a\b`
-		if got := util.ResolveSymlinksBestEffort(in); got != filepath.Clean(in) {
+		got, err := util.ResolveSymlinksBestEffort(in)
+		if err != nil {
+			t.Fatalf("ResolveSymlinksBestEffort(%q): %v", in, err)
+		}
+		if got != filepath.Clean(in) {
 			t.Errorf("ResolveSymlinksBestEffort(%q) = %q, want %q", in, got, filepath.Clean(in))
 		}
 		within, err := fileWithinWorkingDir(in)
@@ -176,6 +181,87 @@ func TestFileWithinWorkingDirWindowsPaths(t *testing.T) {
 		}
 		if within {
 			t.Errorf("fileWithinWorkingDir(%q) = true, want false", in)
+		}
+	})
+
+	t.Run("a root-relative symlink target is judged against the volume root", func(t *testing.T) {
+		// A symlink whose stored target is root-relative (`\Users\...\out`) is
+		// resolved by the kernel from the root of the volume the link sits on,
+		// NOT from the link's directory. A resolver that splices the target
+		// onto the link's parent judges the shadow created below, while
+		// os.ReadFile opens the volume-root path — so the shadow exists on
+		// purpose and this test fails while the resolution is
+		// link-parent-relative.
+		outside := t.TempDir()
+		out := filepath.Join(outside, "out")
+		if err := os.MkdirAll(out, 0o755); err != nil {
+			t.Fatalf("mkdir out: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(out, "stale.md"), []byte("outside"), 0o644); err != nil {
+			t.Fatalf("write out: %v", err)
+		}
+		rel := strings.TrimPrefix(out, filepath.VolumeName(out))
+		if err := os.MkdirAll(filepath.Join(workdir, rel), 0o755); err != nil {
+			t.Fatalf("mkdir shadow: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(workdir, rel, "stale.md"), []byte("shadow"), 0o644); err != nil {
+			t.Fatalf("write shadow: %v", err)
+		}
+		createDirSymlink(t, rel, filepath.Join(workdir, "rrel"))
+		candidate := `rrel\stale.md`
+		if got, err := os.ReadFile(candidate); err != nil {
+			t.Fatalf("read through the link: %v", err)
+		} else if string(got) != "outside" {
+			t.Fatalf("the kernel opened the shadow (%q), not the volume-root target — mklink stored the root-relative target as link-relative on this host, and the test's premise does not hold", got)
+		}
+		within, err := fileWithinWorkingDir(candidate)
+		if err != nil {
+			t.Fatalf("fileWithinWorkingDir(%q): %v", candidate, err)
+		}
+		if within {
+			t.Errorf("fileWithinWorkingDir(%q) = true; the kernel resolves the root-relative target %q from the volume root, not from the link's directory", candidate, rel)
+		}
+	})
+
+	t.Run("a volume-GUID mount target is judged in its own namespace", func(t *testing.T) {
+		// A junction whose substitute name is `\\?\Volume{GUID}\...` is
+		// absolute in the device namespace: the kernel jumps to that volume
+		// directly, and the file through it is really readable — this is not
+		// an inert shape. There is no Win32 spelling to relate to a
+		// drive-letter workdir, so the guard must reject; a resolver that
+		// strips the `\\?\` prefix turns the absolute mount target into a
+		// relative path it splices under the workdir, where the shadow below
+		// would pass for the real outside read.
+		out := filepath.Join(t.TempDir(), "out")
+		if err := os.MkdirAll(out, 0o755); err != nil {
+			t.Fatalf("mkdir out: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(out, "stale.md"), []byte("outside"), 0o644); err != nil {
+			t.Fatalf("write out: %v", err)
+		}
+		guid := volumeGUIDOfSystemDrive(t)
+		vol := filepath.VolumeName(out)
+		guidTarget := guid + strings.TrimPrefix(out, vol+`\`)
+		createJunction(t, guidTarget, filepath.Join(workdir, "vg"))
+		shadow := filepath.Join(workdir, strings.TrimPrefix(guid, `\\?\`)+strings.TrimPrefix(out, vol+`\`))
+		if err := os.MkdirAll(filepath.Dir(shadow), 0o755); err != nil {
+			t.Fatalf("mkdir shadow: %v", err)
+		}
+		if err := os.WriteFile(shadow, []byte("shadow"), 0o644); err != nil {
+			t.Fatalf("write shadow: %v", err)
+		}
+		candidate := `vg\stale.md`
+		if got, err := os.ReadFile(candidate); err != nil {
+			t.Fatalf("read through the junction: %v", err)
+		} else if string(got) != "outside" {
+			t.Fatalf("the kernel opened the shadow (%q), not the GUID-mounted target; the fixture does not hold on this host", got)
+		}
+		within, err := fileWithinWorkingDir(candidate)
+		if err != nil {
+			t.Fatalf("fileWithinWorkingDir(%q): %v", candidate, err)
+		}
+		if within {
+			t.Errorf("fileWithinWorkingDir(%q) = true; the junction's target %q is a device-namespace mount the kernel opens outside the workdir", candidate, guidTarget)
 		}
 	})
 }
@@ -194,6 +280,47 @@ func unusedDriveLetter(t *testing.T) string {
 	}
 	t.Skip("every candidate drive letter is mounted on this host; cannot build a path on an absent volume")
 	return ""
+}
+
+// createDirSymlink makes link a directory symlink to the target string as
+// given. os.Symlink is not used for this: it decides the relative flag from
+// filepath.IsAbs, and a root-relative spelling (`\Users\...`) is not IsAbs,
+// while mklink marks a rooted target absolute — which is the kernel behavior
+// the root-relative case pins. Directory symlinks need the symlink privilege;
+// CI runners have it and non-admin hosts do not, which is why the fixture
+// skips rather than fails there.
+func createDirSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if out, err := exec.Command("cmd", "/c", "mklink", "/D", link, target).CombinedOutput(); err != nil {
+		if strings.Contains(strings.ToLower(string(out)), "privilege") {
+			t.Skipf("symlink privilege unavailable on this host: %s", out)
+		}
+		t.Fatalf("mklink /D %s -> %s: %s: %v", link, target, out, err)
+	}
+}
+
+// volumeGUIDRe matches the `\\?\Volume{GUID}\` form mountvol prints for a
+// mounted volume.
+var volumeGUIDRe = regexp.MustCompile(`\\\\\?\\Volume\{[0-9a-fA-F-]+\}\\`)
+
+// volumeGUIDOfSystemDrive returns the device-namespace spelling of the system
+// drive's volume, the form a junction can carry as its substitute name and a
+// plain Win32 comparison cannot relate to a drive-letter workdir.
+func volumeGUIDOfSystemDrive(t *testing.T) string {
+	t.Helper()
+	drive := os.Getenv("SystemDrive")
+	if drive == "" {
+		drive = `C:`
+	}
+	out, err := exec.Command("mountvol", drive, "/L").CombinedOutput()
+	if err != nil {
+		t.Fatalf("mountvol %s /L: %s: %v", drive, out, err)
+	}
+	guid := volumeGUIDRe.FindString(string(out))
+	if guid == "" {
+		t.Fatalf("mountvol %s /L printed no volume GUID: %s", drive, out)
+	}
+	return guid
 }
 
 // TestFileWithinWorkingDirWindowsJunctions pins how the guard treats directory

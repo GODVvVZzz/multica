@@ -1,16 +1,30 @@
 package util
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 )
 
+// ErrUnresolvablePath is returned by ResolveSymlinksBestEffort when the
+// operating system's own resolution of the path cannot be determined well
+// enough to compare against a root: an unknown redirecting reparse point whose
+// final location even a handle query cannot name, or a Windows drive-relative
+// path on a drive whose current directory this process cannot observe. A
+// caller that uses the result as a containment check must treat the error as
+// OUTSIDE — "cannot say where this opens" is not "opens where the string
+// says". A caller that only wants a canonical form should fall back to the
+// input unchanged.
+var ErrUnresolvablePath = errors.New("path resolution cannot be determined")
+
 // ResolveSymlinksBestEffort canonicalizes p the way the operating system would
 // open it, as far as the filesystem allows: it follows every symlink in the
-// existing prefix of p — on Windows directory junctions too — applying ".."
-// segments to the FOLLOWED path, not to the string, and re-attaches the part
-// that does not exist yet. The result is absolute whenever the process can
-// know what "absolute" means for p.
+// existing prefix of p — on Windows directory junctions and other reparse
+// points too — applying ".." segments to the FOLLOWED path, not to the string,
+// and re-attaches the part that does not exist yet. The result is absolute,
+// and the error is ErrUnresolvablePath when even a fail-closed answer is
+// impossible to compute (see above).
 //
 // Windows path kinds are preserved rather than flattened onto the working
 // directory. A root-relative path (`\tmp\desc.md`) resolves against the root
@@ -19,11 +33,9 @@ import (
 // directory's drive, because those are the files os.ReadFile actually opens.
 // Prefixing either with the working directory instead would let a same-named
 // file inside the workdir shadow the outside file the kernel reads, and a
-// containment check would pass on the shadow. A drive-relative path on any
-// other drive has a per-drive current directory this process cannot observe,
-// so it is handed back uncanonicalized — a containment check against a
-// resolved workdir then fails closed, because filepath.Rel refuses to relate
-// paths across volumes.
+// containment check would pass on the shadow. The same grammar applies to
+// link targets, which the kernel resolves by the same rules rather than
+// relative to the link.
 //
 // Two properties matter to callers that compare the result against a root.
 //
@@ -53,24 +65,27 @@ import (
 // path with an unresolvable prefix cannot be opened at all.
 //
 // This mirrors Python's Path.resolve(strict=False).
-func ResolveSymlinksBestEffort(p string) string {
+func ResolveSymlinksBestEffort(p string) (string, error) {
 	if p == "" {
-		return p
+		return "", nil
 	}
 	abs := absNoClean(p)
 	if !filepath.IsAbs(abs) {
 		// absNoClean could not say what the path is relative to: a working
 		// directory that cannot be observed, or a Windows drive-relative path
-		// on a drive this process has no observable directory for. Return the
-		// input unchanged — for a containment check against a resolved root
-		// that is the fail-closed answer, since the raw form cannot be cleaned
-		// into the root and filepath.Rel errors across volumes.
-		return p
+		// on a drive this process has no observable directory for. There is no
+		// honest string to return — the kernel may well open something this
+		// process cannot name — so this is the error, not a guess.
+		return "", fmt.Errorf("%w: %q has no observable base to resolve against", ErrUnresolvablePath, p)
 	}
 	// Resolve the path as given first. This is the only step that can see a
 	// ".." the way the kernel does, so it must not be preceded by cleaning.
-	if resolved, err := evalPath(abs); err == nil {
-		return resolved
+	resolved, err := evalPath(abs)
+	if errors.Is(err, ErrUnresolvablePath) {
+		return "", err
+	}
+	if err == nil {
+		return resolved, nil
 	}
 	// Walk the UNCLEANED path one component at a time: resolve what exists,
 	// apply ".." to what has been resolved, and re-attach everything after the
@@ -81,16 +96,23 @@ func ResolveSymlinksBestEffort(p string) string {
 	// is unreachable for the kernel either way, so the lexical form is the
 	// best answer available.
 	root, segs := splitNoClean(abs)
-	resolved := root
+	walked := root
 	for i, seg := range segs {
 		switch seg {
 		case "..":
-			resolved = dropLastSegment(resolved)
+			walked = dropLastSegment(walked)
 			continue
 		case ".", "":
 			continue
 		}
-		next, err := evalPath(joinSegment(resolved, seg))
+		next, err := evalPath(joinSegment(walked, seg))
+		if errors.Is(err, ErrUnresolvablePath) {
+			// A component the kernel may resolve somewhere this process cannot
+			// name. Lexically re-attaching the tail would read as inside a
+			// workdir the kernel is not confined to, so this error propagates
+			// instead of degrading into an answer.
+			return "", err
+		}
 		if err != nil {
 			// seg is the first unresolvable component: missing, a permission
 			// wall, too many links, a junction whose target is gone. The
@@ -98,13 +120,13 @@ func ResolveSymlinksBestEffort(p string) string {
 			// nothing after an unresolvable component can be opened, which
 			// makes any divergence inside the tail inert.
 			for _, tail := range segs[i:] {
-				resolved = joinSegment(resolved, tail)
+				walked = joinSegment(walked, tail)
 			}
-			return resolved
+			return walked, nil
 		}
-		resolved = next
+		walked = next
 	}
-	return resolved
+	return walked, nil
 }
 
 // splitNoClean splits an absolute path into its root and its components

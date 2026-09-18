@@ -280,9 +280,17 @@ func hermesRootFromHomeFor(base, native string) string {
 // resolvePathBestEffort resolves symlinks like Python's Path.resolve(strict=False):
 // it follows every symlink in the existing prefix of p and appends the remaining
 // non-existent tail unchanged, rather than failing (as filepath.EvalSymlinks does)
-// when p doesn't fully exist. The result is absolute.
+// when p doesn't fully exist. The result is absolute. When the kernel's own
+// resolution cannot be determined (util.ErrUnresolvablePath — an unknown
+// redirecting reparse point, an unobservable drive), the input is returned
+// unchanged: the containment comparison downstream then fails to relate it and
+// treats it as under nothing, which is the conservative answer.
 func resolvePathBestEffort(p string) string {
-	return util.ResolveSymlinksBestEffort(p)
+	resolved, err := util.ResolveSymlinksBestEffort(p)
+	if err != nil {
+		return p
+	}
+	return resolved
 }
 
 // isPathUnder reports whether child is parent or nested under it.

@@ -150,15 +150,21 @@ func pathExists(filePath string) bool {
 // look like: `\tmp\desc.md` resolves against the workdir's volume ROOT and
 // `C:tmp\desc.md` against the current directory on C:, so prefixing the
 // workdir onto either would judge a shadow file while os.ReadFile opens the
-// real one. util.ResolveSymlinksBestEffort preserves those kinds, and a
-// drive-relative path on an unobservable drive comes back uncanonicalized —
-// which is what makes the Rel branch below the fail-closed answer for it.
+// real one. util.ResolveSymlinksBestEffort preserves those kinds, for link
+// targets as well as for the input itself.
 func fileWithinWorkingDir(filePath string) (bool, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return false, err
 	}
-	base := util.ResolveSymlinksBestEffort(cwd)
+	base, err := util.ResolveSymlinksBestEffort(cwd)
+	if err != nil {
+		// The workdir's own resolution cannot be determined (an unobservable
+		// drive, a reparse point no query can name). Comparing a candidate
+		// against a root that cannot be named judges whatever string the
+		// resolver would have guessed, so fail closed.
+		return false, nil
+	}
 	// Canonicalize the candidate exactly the way the base was, and hand it over
 	// as typed: util.ResolveSymlinksBestEffort makes it absolute itself, because
 	// pre-joining it here would clean the string first and collapse a ".."
@@ -181,21 +187,28 @@ func fileWithinWorkingDir(filePath string) (bool, error) {
 	//     canonical cwd it reads `escape/sub/x.md` — under a symlink pointing
 	//     out of the workdir — as INSIDE it, because the unresolvable tail
 	//     falls back to a lexical clean that never sees the symlink.
-	abs := util.ResolveSymlinksBestEffort(filePath)
+	abs, err := util.ResolveSymlinksBestEffort(filePath)
+	if err != nil {
+		// ErrUnresolvablePath: the kernel may open this path somewhere this
+		// process cannot name — a reparse point that redirects but survives
+		// both os.Readlink and a handle query, or a drive-relative path on a
+		// drive whose current directory is unobservable. The string the input
+		// spells is not evidence of where the kernel would read, so fail
+		// closed; the caller's own os.ReadFile would surface a plain error
+		// for the same path.
+		return false, nil
+	}
 	rel, err := filepath.Rel(base, abs)
 	if err != nil {
 		// Two absolute paths that filepath.Rel cannot relate are on different
 		// volumes, which is as far outside the workdir as a path can get. Only
-		// Windows produces this, in two shapes: an absolute path on another
-		// volume (`--content-file Z:\report.md` used to surface `Rel: can't
-		// make Z:\report.md relative to C:\...` as an internal resolve failure
-		// instead of the guardrail's own explanation), and a drive-relative
-		// path on a drive whose current directory this process cannot observe,
-		// which util.ResolveSymlinksBestEffort hands back uncanonicalized.
-		// Both read as outside here — fail closed. Measured on 10.0.19045 /
-		// go1.26.6. There is no Unix input that reaches this branch, so the
-		// windows-tagged test in this package is the only thing that covers
-		// it.
+		// Windows produces this: with a workdir on C:, `--content-file
+		// Z:\report.md` used to surface `Rel: can't make Z:\report.md relative
+		// to C:\...` as an internal resolve failure instead of the guardrail's
+		// own explanation — the same misleading-diagnosis shape this guard is
+		// being fixed for. Measured on 10.0.19045 / go1.26.6. There is no Unix
+		// input that reaches this branch, so the windows-tagged test in this
+		// package is the only thing that covers it.
 		return false, nil
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {

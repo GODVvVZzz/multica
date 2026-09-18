@@ -80,7 +80,11 @@ func TestResolveSymlinksBestEffort(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ResolveSymlinksBestEffort(tc.in); got != tc.want {
+			got, err := ResolveSymlinksBestEffort(tc.in)
+			if err != nil {
+				t.Fatalf("ResolveSymlinksBestEffort(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
 				t.Errorf("ResolveSymlinksBestEffort(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
@@ -88,7 +92,10 @@ func TestResolveSymlinksBestEffort(t *testing.T) {
 
 	t.Run("relative input is made absolute against the working directory", func(t *testing.T) {
 		t.Chdir(logical)
-		got := ResolveSymlinksBestEffort(filepath.Join("subdir", "file.txt"))
+		got, err := ResolveSymlinksBestEffort(filepath.Join("subdir", "file.txt"))
+		if err != nil {
+			t.Fatalf("ResolveSymlinksBestEffort(relative): %v", err)
+		}
 		want := filepath.Join(realPhysical, "subdir", "file.txt")
 		if got != want {
 			t.Errorf("ResolveSymlinksBestEffort(relative) = %q, want %q", got, want)
@@ -102,7 +109,10 @@ func TestResolveSymlinksBestEffort(t *testing.T) {
 		// link's TARGET. Anything that cleans before resolving reports the wrong
 		// namespace here, and does so for a path that exists and can be read.
 		sep := string(filepath.Separator)
-		got := ResolveSymlinksBestEffort(filepath.Join(logical, "existing") + sep + ".." + sep + "sibling.md")
+		got, err := ResolveSymlinksBestEffort(filepath.Join(logical, "existing") + sep + ".." + sep + "sibling.md")
+		if err != nil {
+			t.Fatalf("ResolveSymlinksBestEffort(dot-dot): %v", err)
+		}
 		want := filepath.Join(realPhysical, "sibling.md")
 		if got != want {
 			t.Errorf("ResolveSymlinksBestEffort(dot-dot) = %q, want %q", got, want)
@@ -124,7 +134,10 @@ func TestResolveSymlinksBestEffort(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolve outside: %v", err)
 		}
-		got = ResolveSymlinksBestEffort(link + sep + ".." + sep + "other-run.md")
+		got, err = ResolveSymlinksBestEffort(link + sep + ".." + sep + "other-run.md")
+		if err != nil {
+			t.Fatalf("ResolveSymlinksBestEffort(escape/..): %v", err)
+		}
 		want = filepath.Join(realOutside, "other-run.md")
 		if got != want {
 			t.Errorf("ResolveSymlinksBestEffort(escape/..) = %q, want %q", got, want)
@@ -157,7 +170,11 @@ func TestResolveSymlinksBestEffort(t *testing.T) {
 		sep := string(filepath.Separator)
 		in := filepath.Join(logical, "esc") + sep + ".." + sep + filepath.Join("missingdir", "x.md")
 		want := filepath.Join(realOutsideRoot, "missingdir", "x.md")
-		if got := ResolveSymlinksBestEffort(in); got != want {
+		got, err := ResolveSymlinksBestEffort(in)
+		if err != nil {
+			t.Fatalf("ResolveSymlinksBestEffort(%q): %v", in, err)
+		}
+		if got != want {
 			t.Errorf("ResolveSymlinksBestEffort(%q) = %q, want %q", in, got, want)
 		}
 	})
@@ -174,7 +191,11 @@ func TestResolveSymlinksBestEffort(t *testing.T) {
 		if err != nil {
 			t.Fatalf("abs: %v", err)
 		}
-		if got := ResolveSymlinksBestEffort(in); got != want {
+		got, err := ResolveSymlinksBestEffort(in)
+		if err != nil {
+			t.Fatalf("ResolveSymlinksBestEffort(%q): %v", in, err)
+		}
+		if got != want {
 			t.Errorf("ResolveSymlinksBestEffort(%q) = %q, want %q", in, got, want)
 		}
 	})
