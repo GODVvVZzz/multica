@@ -203,6 +203,15 @@ func classifyTarget(target, linkDir string) (base string, tSegs []string, verbat
 		}
 		return classifyTarget(t, linkDir)
 	}
+	if filepath.IsAbs(target) {
+		// Drive-absolute and UNC. This MUST precede the VolumeName check
+		// below: VolumeName is non-empty for `C:\dir` too, and misreading a
+		// drive-absolute target as drive-relative resolves it against the
+		// working directory instead of the volume root — which is how a
+		// junction escape read as inside the workdir on CI.
+		root, segs := splitNoClean(target)
+		return root, segs, false, true
+	}
 	if len(target) > 0 && os.IsPathSeparator(target[0]) {
 		conv := filepath.VolumeName(linkDir) + filepath.FromSlash(target)
 		root, segs := splitNoClean(conv)
@@ -219,10 +228,6 @@ func classifyTarget(target, linkDir string) (base string, tSegs []string, verbat
 			return root, segs, false, true
 		}
 		return "", nil, false, false
-	}
-	if filepath.IsAbs(target) {
-		root, segs := splitNoClean(target)
-		return root, segs, false, true
 	}
 	_, segs := splitNoClean(target)
 	return linkDir, segs, false, true
