@@ -56,8 +56,10 @@ func TestClassifyTarget(t *testing.T) {
 		{
 			name:     "drive-relative target on the current drive resolves against the working directory",
 			target:   vol + `outside\dir`,
-			wantBase: cwd + sep,
-			wantTail: `outside\dir`,
+			wantBase: vol + sep,
+			// The working directory's components are part of the walked tail,
+			// not of the root the walk starts from.
+			wantTail: strings.TrimPrefix(cwd, vol+sep) + sep + `outside` + sep + `dir`,
 			wantOK:   true,
 		},
 		{
@@ -68,7 +70,7 @@ func TestClassifyTarget(t *testing.T) {
 		{
 			name:     "plain-relative target keeps the link's directory as base",
 			target:   `relative\dir`,
-			wantBase: cwd + sep,
+			wantBase: cwd,
 			wantTail: `relative\dir`,
 			wantOK:   true,
 		},
